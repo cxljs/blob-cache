@@ -200,7 +200,7 @@ func TestCacheFilterPhantom(t *testing.T) {
 			leaves = append(leaves, fmt.Sprintf("%v:%s", reason, key))
 		}))
 	})
-	c.setPipe(p)
+	c.SetPipe(p)
 
 	e := c.Insert("denied", 42)
 	if e.IsNil() || e.Value() != 42 {
@@ -238,7 +238,7 @@ func TestCachePipeOnEvict(t *testing.T) {
 	c := newTestCache(t, 4, func(b *Builder[string, int]) {
 		b.WithEvictionConfig(LruConfig{HighPriorityPoolRatio: 0})
 	})
-	c.setPipe(p)
+	c.SetPipe(p)
 
 	for i := 0; i < 6; i++ {
 		c.Insert(fmt.Sprintf("k%d", i), i)

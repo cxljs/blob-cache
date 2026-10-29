@@ -238,12 +238,19 @@ func (c *Cache[K, V]) shardFor(hash uint64) *shard[K, V] {
 }
 
 // setPipe attaches the offload pipe used by the hybrid cache.
-func (c *Cache[K, V]) setPipe(p *Pipe[K, V]) { c.inner.pipe.Store(p) }
+func (c *Cache[K, V]) SetPipe(p *Pipe[K, V]) { c.inner.pipe.Store(p) }
 
 // Pipe returns the attached pipe, or nil.
 func (c *Cache[K, V]) Pipe() *Pipe[K, V] { return c.inner.pipe.Load() }
 
 func (c *Cache[K, V]) piped() bool { return c.inner.pipe.Load() != nil }
+
+// Hash returns the in-memory hash of the key. It uses a per-process seed
+// (hash/maphash) and is only meaningful within this cache instance, e.g.
+// to build pieces for InsertPiece.
+func (c *Cache[K, V]) Hash(key K) uint64 {
+	return maphash.Comparable(c.inner.hashSeed, key)
+}
 
 func (c *Cache[K, V]) hash(key K) uint64 {
 	return maphash.Comparable(c.inner.hashSeed, key)

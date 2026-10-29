@@ -56,6 +56,20 @@ func (p *Pipe[K, V]) PopAll() []Piece[K, V] {
 	return out
 }
 
+// PopAllWait waits until at least one piece is queued (or the pipe is
+// closed) and drains the queue. It is used by the consumer pumping evicted
+// pieces into the disk cache.
+func (p *Pipe[K, V]) PopAllWait() []Piece[K, V] {
+	p.mu.Lock()
+	for len(p.queue) == 0 && !p.closed {
+		p.cond.Wait()
+	}
+	out := p.queue
+	p.queue = nil
+	p.mu.Unlock()
+	return out
+}
+
 // Len returns the number of queued pieces.
 func (p *Pipe[K, V]) Len() int {
 	p.mu.Lock()

@@ -72,7 +72,7 @@ func TestGetOrFetchPhantom(t *testing.T) {
 	c := newTestCache(t, 10, func(b *Builder[string, int]) {
 		b.WithFilter(func(key string, _ int) bool { return key != "denied" })
 	})
-	c.setPipe(p)
+	c.SetPipe(p)
 
 	e, err := c.GetOrFetch("denied", func() (int, error) { return 5, nil })
 	if err != nil || e.Value() != 5 {
