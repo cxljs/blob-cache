@@ -81,17 +81,23 @@ func newShard[K comparable, V any](capacity int, cfg EvictionConfig, metrics *co
 }
 
 // newEviction builds the eviction container for the given config. The
-// default is LRU.
+// default is w-TinyLFU (LFU), mirroring foyer.
 func newEviction[K comparable, V any](capacity int, cfg EvictionConfig) eviction[K, V] {
 	switch c := cfg.(type) {
 	case FifoConfig:
 		return newFifo[K, V](capacity, c)
 	case LruConfig:
 		return newLru[K, V](capacity, c)
+	case LfuConfig:
+		return newLfu[K, V](capacity, c)
+	case S3FifoConfig:
+		return newS3fifo[K, V](capacity, c)
+	case SieveConfig:
+		return newSieve[K, V](capacity, c)
 	case nil:
-		return newLru[K, V](capacity, DefaultLruConfig())
+		return newLfu[K, V](capacity, DefaultLfuConfig())
 	default:
-		return newLru[K, V](capacity, DefaultLruConfig())
+		return newLfu[K, V](capacity, DefaultLfuConfig())
 	}
 }
 
