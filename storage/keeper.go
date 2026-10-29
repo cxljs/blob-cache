@@ -2,36 +2,39 @@ package storage
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"blob-cache/memory"
 )
 
 // PieceRef is a reference to an in-memory cache piece sitting in the disk
-// cache write queue, mirroring foyer's `PieceRef`. It tracks whether it is
-// still the current keeper registration for its key, so that superseded
-// pieces do not remove newer ones when flushed.
+// cache write queue, mirroring foyer's `PieceRef`.
+//
+// The keeper holds exactly one PieceRef per pending key: a newer
+// registration for the same key replaces the older one in the shard map,
+// so pointer identity decides whether a flushed piece may remove the
+// registration (a superseded reference can no longer be the map entry).
 type PieceRef[K comparable, V any] struct {
 	Piece memory.Piece[K, V]
 
-	keeper  *Keeper[K, V]
-	current *atomic.Bool
+	keeper *Keeper[K, V]
 }
 
-// IsCurrent reports whether this reference owns the current keeper
-// registration.
-func (r *PieceRef[K, V]) IsCurrent() bool { return r.current.Load() }
+// IsCurrent reports whether this reference is still the current keeper
+// registration for its key.
+func (r *PieceRef[K, V]) IsCurrent() bool {
+	sh := r.keeper.shard(r.Piece.Hash())
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return sh.m[r.Piece.Key()] == r
+}
 
 // Remove drops the keeper registration owned by this reference. It is
 // called by the engine after the piece has been flushed to the device.
 func (r *PieceRef[K, V]) Remove() {
-	if !r.current.Load() {
-		return
-	}
 	sh := r.keeper.shard(r.Piece.Hash())
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	if p, ok := sh.m[r.Piece.Key()]; ok && p.current == r.current {
+	if sh.m[r.Piece.Key()] == r {
 		delete(sh.m, r.Piece.Key())
 	}
 }
@@ -39,13 +42,7 @@ func (r *PieceRef[K, V]) Remove() {
 // keeperShard is one shard of the keeper.
 type keeperShard[K comparable, V any] struct {
 	mu sync.Mutex
-	m  map[K]*pendingEntry[K, V]
-}
-
-// pendingEntry is one registration of a pending piece.
-type pendingEntry[K comparable, V any] struct {
-	current *atomic.Bool
-	piece   memory.Piece[K, V]
+	m  map[K]*PieceRef[K, V]
 }
 
 // Keeper holds the pieces recently enqueued into the disk cache write
@@ -62,7 +59,7 @@ func NewKeeper[K comparable, V any](shards int) *Keeper[K, V] {
 	}
 	k := &Keeper[K, V]{shards: make([]*keeperShard[K, V], shards)}
 	for i := range k.shards {
-		k.shards[i] = &keeperShard[K, V]{m: make(map[K]*pendingEntry[K, V])}
+		k.shards[i] = &keeperShard[K, V]{m: make(map[K]*PieceRef[K, V])}
 	}
 	return k
 }
@@ -75,17 +72,13 @@ func (k *Keeper[K, V]) shard(hash uint64) *keeperShard[K, V] {
 // same key, and returns the piece reference handed to the engine.
 func (k *Keeper[K, V]) Insert(piece memory.Piece[K, V]) *PieceRef[K, V] {
 	sh := k.shard(piece.Hash())
-	current := new(atomic.Bool)
-	current.Store(true)
 
 	sh.mu.Lock()
-	if old, ok := sh.m[piece.Key()]; ok {
-		old.current.Store(false)
-	}
-	sh.m[piece.Key()] = &pendingEntry[K, V]{current: current, piece: piece}
+	ref := &PieceRef[K, V]{Piece: piece, keeper: k}
+	sh.m[piece.Key()] = ref
 	sh.mu.Unlock()
 
-	return &PieceRef[K, V]{Piece: piece, keeper: k, current: current}
+	return ref
 }
 
 // Get returns the pending piece for the key, if any.
@@ -93,11 +86,11 @@ func (k *Keeper[K, V]) Get(hash uint64, key K) (memory.Piece[K, V], bool) {
 	sh := k.shard(hash)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	p, ok := sh.m[key]
+	ref, ok := sh.m[key]
 	if !ok {
 		return memory.Piece[K, V]{}, false
 	}
-	return p.piece, true
+	return ref.Piece, true
 }
 
 // Contains reports whether the keeper holds a pending piece for the key.

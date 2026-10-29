@@ -2,8 +2,6 @@ package memory
 
 import (
 	"math"
-
-	"blob-cache/common"
 )
 
 // countMinSketch is a compact frequency estimator, the counterpart of the
@@ -42,12 +40,18 @@ func newCountMinSketch(numHashes, numBuckets int) *countMinSketch {
 }
 
 // hashAt computes the bucket index of key in row i.
+//
+// The key is already a 64-bit hash from the cache hasher; row indices are
+// derived with the splitmix64 finalizer, which is far cheaper than hashing
+// the key again per row.
 func (c *countMinSketch) hashAt(key uint64, i int) int {
-	h := common.Sum64XXH64([]byte{
-		byte(key), byte(key >> 8), byte(key >> 16), byte(key >> 24),
-		byte(key >> 32), byte(key >> 40), byte(key >> 48), byte(key >> 56),
-	}, uint64(i)+1)
-	return int(h % uint64(c.numBuckets))
+	return int(mix64(key+uint64(i)*0x9E3779B97F4A7C15) % uint64(c.numBuckets))
+}
+
+func mix64(x uint64) uint64 {
+	x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9
+	x = (x ^ (x >> 27)) * 0x94D049BB133111EB
+	return x ^ (x >> 31)
 }
 
 // update increments the estimated frequency of the key by one.

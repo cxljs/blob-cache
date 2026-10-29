@@ -72,17 +72,17 @@ func TestGetOrFetchDedup(t *testing.T) {
 // the entry instead of an empty result.
 func TestInflightLateFollower(t *testing.T) {
 	c := newTestCache(t, 10)
-	m := newInflightManager[string, int]()
-	call, isLeader := m.register("k")
+	m := NewInflightManager[string, int]()
+	call, isLeader := m.Register("k")
 	if !isLeader {
 		t.Fatal("expected to be the leader")
 	}
 
 	entry := c.Insert("k", 42)
-	call.complete(entry, nil)
+	call.Complete(entry, nil)
 
 	// A follower that arrives after completion.
-	ch := call.follow()
+	ch := call.Follow()
 	select {
 	case e := <-ch:
 		if e.Value() != 42 {
@@ -95,20 +95,20 @@ func TestInflightLateFollower(t *testing.T) {
 
 	// A follower that arrived before completion with an error gets the
 	// error, not an entry.
-	call2, isLeader := m.register("e")
+	call2, isLeader := m.Register("e")
 	if !isLeader {
 		t.Fatal("expected to be the leader")
 	}
-	ch2 := call2.follow()
-	call2.complete(CacheEntry[string, int]{}, fmt.Errorf("boom"))
+	ch2 := call2.Follow()
+	call2.Complete(CacheEntry[string, int]{}, fmt.Errorf("boom"))
 	<-call2.done
 	select {
 	case e := <-ch2:
 		t.Fatalf("error call delivered an entry: %v", e.Value())
 	default:
 	}
-	m.unregister("k", call)
-	m.unregister("e", call2)
+	m.Unregister("k", call)
+	m.Unregister("e", call2)
 	entry.Release()
 }
 

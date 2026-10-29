@@ -69,11 +69,11 @@ type s3fifo[K comparable, V any] struct {
 	small *list.List
 	main  *list.List
 
-	smallWeight     int
-	mainWeight      int
-	smallWeightCap  int
-	freqThreshold   uint8
-	config          S3FifoConfig
+	smallWeight    int
+	mainWeight     int
+	smallWeightCap int
+	freqThreshold  uint8
+	config         S3FifoConfig
 }
 
 func newS3fifo[K comparable, V any](capacity int, cfg EvictionConfig) *s3fifo[K, V] {
@@ -88,11 +88,11 @@ func newS3fifo[K comparable, V any](capacity int, cfg EvictionConfig) *s3fifo[K,
 		panic(err)
 	}
 	s := &s3fifo[K, V]{
-		ghost:        newGhostQueue(int(float64(capacity) * c.GhostQueueCapacityRatio)),
-		small:        list.New(),
-		main:         list.New(),
+		ghost:         newGhostQueue(int(float64(capacity) * c.GhostQueueCapacityRatio)),
+		small:         list.New(),
+		main:          list.New(),
 		freqThreshold: min8(c.SmallToMainFreqThreshold, s3fifoMaxFrequency),
-		config:       c,
+		config:        c,
 	}
 	s.smallWeightCap = int(float64(capacity) * c.SmallQueueCapacityRatio)
 	return s

@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"errors"
+	"os"
 	"sort"
 	"sync"
 
@@ -133,9 +135,12 @@ type blobEngine[K comparable, V any] struct {
 	picker   BlobPicker
 	metrics  *common.Metrics
 
-	mu       sync.Mutex
-	cond     *sync.Cond
-	subs     []submission[K, V]
+	mu   sync.Mutex
+	cond *sync.Cond
+	subs []submission[K, V]
+	// spare recycles the backing array of the previous submission batch so
+	// that enqueue does not re-grow the queue after every handoff.
+	spare    []submission[K, V]
 	closed   bool
 	closeErr error
 	done     chan struct{}
@@ -143,6 +148,13 @@ type blobEngine[K comparable, V any] struct {
 	// scratch is a flusher-goroutine-local serialization buffer, reused
 	// across records to avoid one allocation per entry.
 	scratch []byte
+	// recordBuf/deletesBuf/waitsBuf/batchBuf/refsBuf are flusher-goroutine
+	//-local scratch slices reused across batches.
+	recordBuf  []rawRecord[K, V]
+	deletesBuf []uint64
+	waitsBuf   []chan struct{}
+	batchBuf   []hashedAddress
+	refsBuf    []*PieceRef[K, V]
 
 	// Flusher-owned state. Guarded by mu while the flusher is not running
 	// (i.e. during recovery and close).
@@ -181,14 +193,18 @@ func NewBlobEngine[K comparable, V any](cfg BlobEngineConfig[K, V]) (Engine[K, V
 	}
 
 	e := &blobEngine[K, V]{
-		cfg:      cfg,
-		dev:      cfg.Device,
-		ix:       newIndexer(cfg.IndexerShards),
-		maxBlobs: int(maxBlobs),
-		picker:   picker,
-		metrics:  cfg.Metrics,
-		done:     make(chan struct{}),
-		blobs:    make(map[BlobID]*BlobInfo),
+		cfg:       cfg,
+		dev:       cfg.Device,
+		ix:        newIndexer(cfg.IndexerShards),
+		maxBlobs:  int(maxBlobs),
+		picker:    picker,
+		metrics:   cfg.Metrics,
+		done:      make(chan struct{}),
+		blobs:     make(map[BlobID]*BlobInfo),
+		spare:     make([]submission[K, V], 0, 64),
+		recordBuf: make([]rawRecord[K, V], 0, 64),
+		batchBuf:  make([]hashedAddress, 0, 64),
+		refsBuf:   make([]*PieceRef[K, V], 0, 64),
 	}
 	e.cond = sync.NewCond(&e.mu)
 
@@ -329,7 +345,8 @@ func (e *blobEngine[K, V]) run() {
 			e.cond.Wait()
 		}
 		batch := e.subs
-		e.subs = nil
+		e.subs = e.spare[:0]
+		e.spare = nil
 		closed := e.closed
 		e.mu.Unlock()
 
@@ -347,6 +364,10 @@ func (e *blobEngine[K, V]) run() {
 			}
 			return
 		}
+		// Recycle the processed batch's backing array for a future batch.
+		e.mu.Lock()
+		e.spare = batch[:0]
+		e.mu.Unlock()
 	}
 }
 
@@ -355,9 +376,9 @@ func (e *blobEngine[K, V]) run() {
 // enqueued and deleted within the same batch is not resurrected by its own
 // write), and waiters are unblocked last.
 func (e *blobEngine[K, V]) handle(batch []submission[K, V]) error {
-	var records []rawRecord[K, V]
-	var deletes []uint64
-	var waitChs []chan struct{}
+	records := e.recordBuf[:0]
+	deletes := e.deletesBuf[:0]
+	waitChs := e.waitsBuf[:0]
 	for _, s := range batch {
 		switch s.kind {
 		case subInsert:
@@ -379,6 +400,10 @@ func (e *blobEngine[K, V]) handle(batch []submission[K, V]) error {
 			waitChs = append(waitChs, s.waitCh)
 		}
 	}
+	e.recordBuf = records
+	e.deletesBuf = deletes
+	e.waitsBuf = waitChs
+
 	err := e.writeRecords(records)
 	for _, hash := range deletes {
 		if old, ok := e.ix.remove(hash); ok {
@@ -397,15 +422,28 @@ func (e *blobEngine[K, V]) handle(batch []submission[K, V]) error {
 // writeRecords appends records into the current blob, rotating and
 // reclaiming as needed.
 func (e *blobEngine[K, V]) writeRecords(records []rawRecord[K, V]) error {
-	var batch []hashedAddress
-	var writtenRefs []*PieceRef[K, V]
+	batch := e.batchBuf[:0]
+	writtenRefs := e.refsBuf[:0]
+	defer func() {
+		e.batchBuf = batch
+		e.refsBuf = writtenRefs
+	}()
 
 	for _, r := range records {
 		if err := e.ensureSpace(int64(entryLen(len(r.key), len(r.value)))); err != nil {
+			// Drop the keeper registrations of what was already written;
+			// their bytes stay on the device unindexed and are treated as
+			// invalid by the next recovery/vacuum.
+			for _, ref := range writtenRefs {
+				ref.Remove()
+			}
 			return err
 		}
 		e.scratch = appendEntry(e.scratch[:0], r.hash, r.key, r.value, r.props)
 		if err := e.dev.Write(e.current, e.scratch, e.offset); err != nil {
+			for _, ref := range writtenRefs {
+				ref.Remove()
+			}
 			return err
 		}
 		batch = append(batch, hashedAddress{hash: r.hash, address: EntryAddress{
@@ -473,6 +511,11 @@ func (e *blobEngine[K, V]) reclaim() error {
 // is the disk cache eviction), as are survivors that were superseded by a
 // newer write elsewhere.
 func (e *blobEngine[K, V]) vacuum(victim BlobID) error {
+	if victim == e.current {
+		// The victim must never be the blob being written: reinserting
+		// survivors into the victim itself would dangle the indexer.
+		return nil
+	}
 	info, ok := e.blobs[victim]
 	if !ok {
 		return nil
@@ -614,6 +657,11 @@ func (e *blobEngine[K, V]) Load(ctx context.Context, hash uint64) (Load[K, V], e
 	}
 	buf := make([]byte, addr.Len)
 	if err := e.dev.Read(addr.Blob, buf, addr.Offset); err != nil {
+		if isNotExist(err) {
+			// The blob was reclaimed (or destroyed) concurrently with this
+			// load; treat the entry as missing instead of failing.
+			return Load[K, V]{Kind: LoadMiss}, nil
+		}
 		return Load[K, V]{}, err
 	}
 	h, ok := parseEntryHeader(buf)
@@ -637,6 +685,15 @@ func (e *blobEngine[K, V]) Load(ctx context.Context, hash uint64) (Load[K, V], e
 		return Load[K, V]{}, err
 	}
 	return Load[K, V]{Kind: LoadEntry, Key: k, Value: v, Age: h.props.Age}, nil
+}
+
+// isNotExist reports whether err wraps a file-not-found error.
+func isNotExist(err error) bool {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return os.IsNotExist(pathErr)
+	}
+	return false
 }
 
 // MayContains implements Engine.
@@ -700,24 +757,36 @@ func (e *blobEngine[K, V]) Close(ctx context.Context) error {
 
 // Destroy implements Engine. It removes all data and resets the engine so
 // that it keeps working with an empty device (used by hybrid clear).
+//
+// The old flusher is always joined (regardless of ctx cancellation)
+// before the state reset: letting it run past the reset would leave two
+// flushers mutating the same unlocked state. Destroy therefore always
+// completes atomically; ctx cancellation does not abort it.
 func (e *blobEngine[K, V]) Destroy(ctx context.Context) error {
-	if err := e.Close(ctx); err != nil {
-		return err
+	e.mu.Lock()
+	if !e.closed {
+		e.closed = true
+		e.cond.Broadcast()
 	}
+	e.mu.Unlock()
+
+	<-e.done
+
 	if err := e.dev.Destroy(); err != nil {
 		return err
 	}
 
 	e.ix.clear()
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.blobs = make(map[BlobID]*BlobInfo)
 	e.current = 0
 	e.offset = 0
 	e.closed = false
 	e.closeErr = nil
 	e.done = make(chan struct{})
-	if err := e.openBlob(0); err != nil {
+	err := e.openBlob(0)
+	e.mu.Unlock()
+	if err != nil {
 		return err
 	}
 	go e.run()

@@ -10,7 +10,7 @@ import (
 // inflightCall is one in-progress fetch for a key, the counterpart of
 // foyer's `Inflight`. The leader runs the fetch and inserts the record;
 // followers receive a clone of the resulting entry (or the error).
-type inflightCall[K comparable, V any] struct {
+type InflightCall[K comparable, V any] struct {
 	done chan struct{}
 
 	mu        sync.Mutex
@@ -20,15 +20,15 @@ type inflightCall[K comparable, V any] struct {
 	err       error
 }
 
-func newInflightCall[K comparable, V any]() *inflightCall[K, V] {
-	return &inflightCall[K, V]{done: make(chan struct{})}
+func newInflightCall[K comparable, V any]() *InflightCall[K, V] {
+	return &InflightCall[K, V]{done: make(chan struct{})}
 }
 
 // follow registers the caller as a follower of the call and returns the
 // channel delivering the entry. If the call already completed, the result
 // is delivered into the channel immediately, so a follower that lost the
 // race against complete() still receives it.
-func (c *inflightCall[K, V]) follow() chan CacheEntry[K, V] {
+func (c *InflightCall[K, V]) Follow() chan CacheEntry[K, V] {
 	ch := make(chan CacheEntry[K, V], 1)
 	c.mu.Lock()
 	switch {
@@ -43,7 +43,7 @@ func (c *inflightCall[K, V]) follow() chan CacheEntry[K, V] {
 
 // complete delivers the entry to all followers and unblocks them. It must
 // be called exactly once.
-func (c *inflightCall[K, V]) complete(entry CacheEntry[K, V], err error) {
+func (c *InflightCall[K, V]) Complete(entry CacheEntry[K, V], err error) {
 	c.mu.Lock()
 	c.completed = true
 	c.entry = entry
@@ -58,20 +58,30 @@ func (c *inflightCall[K, V]) complete(entry CacheEntry[K, V], err error) {
 	close(c.done)
 }
 
-// inflightManager dedups concurrent fetches for the same key within one
-// shard, mirroring foyer's `InflightManager`.
-type inflightManager[K comparable, V any] struct {
-	mu sync.Mutex
-	m  map[K]*inflightCall[K, V]
+// Done returns the channel closed when the call completes.
+func (c *InflightCall[K, V]) Done() <-chan struct{} { return c.done }
+
+// Err returns the error the call completed with.
+func (c *InflightCall[K, V]) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
 }
 
-func newInflightManager[K comparable, V any]() *inflightManager[K, V] {
-	return &inflightManager[K, V]{m: make(map[K]*inflightCall[K, V])}
+// inflightManager dedups concurrent fetches for the same key within one
+// shard, mirroring foyer's `InflightManager`.
+type InflightManager[K comparable, V any] struct {
+	mu sync.Mutex
+	m  map[K]*InflightCall[K, V]
+}
+
+func NewInflightManager[K comparable, V any]() *InflightManager[K, V] {
+	return &InflightManager[K, V]{m: make(map[K]*InflightCall[K, V])}
 }
 
 // register returns the call for the key. isLeader reports whether the
 // caller must run the fetch and complete the call.
-func (m *inflightManager[K, V]) register(key K) (call *inflightCall[K, V], isLeader bool) {
+func (m *InflightManager[K, V]) Register(key K) (call *InflightCall[K, V], isLeader bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if call, ok := m.m[key]; ok {
@@ -82,7 +92,7 @@ func (m *inflightManager[K, V]) register(key K) (call *inflightCall[K, V], isLea
 	return call, true
 }
 
-func (m *inflightManager[K, V]) unregister(key K, call *inflightCall[K, V]) {
+func (m *InflightManager[K, V]) Unregister(key K, call *InflightCall[K, V]) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.m[key] == call {
@@ -111,9 +121,9 @@ func (c *Cache[K, V]) getOrFetchInner(key K, fetch func() (V, error), props comm
 
 	hash := c.hash(key)
 	m := c.managerFor(hash)
-	call, isLeader := m.register(key)
+	call, isLeader := m.Register(key)
 	if !isLeader {
-		ch := call.follow()
+		ch := call.Follow()
 		<-call.done
 		select {
 		case entry := <-ch:
@@ -128,15 +138,15 @@ func (c *Cache[K, V]) getOrFetchInner(key K, fetch func() (V, error), props comm
 	func() {
 		defer func() {
 			if p := recover(); p != nil {
-				call.complete(CacheEntry[K, V]{}, fmt.Errorf("blob-cache: fetch panicked: %v", p))
-				m.unregister(key, call)
+				call.Complete(CacheEntry[K, V]{}, fmt.Errorf("blob-cache: fetch panicked: %v", p))
+				m.Unregister(key, call)
 				panic(p)
 			}
 		}()
 		var value V
 		value, err = fetch()
 		if err != nil {
-			call.complete(CacheEntry[K, V]{}, err)
+			call.Complete(CacheEntry[K, V]{}, err)
 			return
 		}
 		if !c.inner.filter(key, value) {
@@ -147,13 +157,13 @@ func (c *Cache[K, V]) getOrFetchInner(key K, fetch func() (V, error), props comm
 		}
 		rec := newRecord(key, value, props, hash, c.inner.weighter(key, value))
 		entry = c.insertInner(rec, source)
-		call.complete(entry, nil)
+		call.Complete(entry, nil)
 	}()
 
-	m.unregister(key, call)
+	m.Unregister(key, call)
 	return entry, err
 }
 
-func (c *Cache[K, V]) managerFor(hash uint64) *inflightManager[K, V] {
+func (c *Cache[K, V]) managerFor(hash uint64) *InflightManager[K, V] {
 	return c.inner.inflights[hash%uint64(len(c.inner.inflights))]
 }

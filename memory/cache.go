@@ -34,7 +34,12 @@ type cacheInner[K comparable, V any] struct {
 	filter        Filter[K, V]
 	eventListener common.EventListener[K, V]
 	pipe          atomic.Pointer[Pipe[K, V]]
-	inflights     []*inflightManager[K, V]
+	inflights     []*InflightManager[K, V]
+	// entryFinalizers attaches runtime finalizers to cache entries so
+	// that forgotten entries are released lazily by the GC. It costs
+	// extra allocations and GC pressure on the Get path; disabling it
+	// makes Release mandatory for every acquired entry.
+	entryFinalizers bool
 
 	metrics *common.Metrics
 }
@@ -104,21 +109,23 @@ func newEviction[K comparable, V any](capacity int, cfg EvictionConfig) eviction
 
 // Builder builds a Cache, mirroring foyer's `CacheBuilder`.
 type Builder[K comparable, V any] struct {
-	capacity       int
-	shards         int
-	evictionConfig EvictionConfig
-	weighter       Weighter[K, V]
-	filter         Filter[K, V]
-	eventListener  common.EventListener[K, V]
-	name           string
-	metrics        *common.Metrics
+	capacity        int
+	shards          int
+	evictionConfig  EvictionConfig
+	weighter        Weighter[K, V]
+	filter          Filter[K, V]
+	eventListener   common.EventListener[K, V]
+	name            string
+	metrics         *common.Metrics
+	entryFinalizers bool
 }
 
 // NewBuilder creates a cache builder with the given total capacity.
 func NewBuilder[K comparable, V any](capacity int) *Builder[K, V] {
 	return &Builder[K, V]{
-		capacity: capacity,
-		name:     "blob-cache",
+		capacity:        capacity,
+		name:            "blob-cache",
+		entryFinalizers: true,
 	}
 }
 
@@ -168,6 +175,15 @@ func (b *Builder[K, V]) WithMetrics(m *common.Metrics) *Builder[K, V] {
 	return b
 }
 
+// WithEntryFinalizers sets whether cache entries get runtime finalizers as
+// a safety net for callers that forget to release them. Default: true.
+// Disabling it removes the finalizer cost from the Get path (~15% with
+// GC pressure) but makes CacheEntry.Release mandatory.
+func (b *Builder[K, V]) WithEntryFinalizers(enabled bool) *Builder[K, V] {
+	b.entryFinalizers = enabled
+	return b
+}
+
 // Build creates the cache.
 func (b *Builder[K, V]) Build() *Cache[K, V] {
 	if b.capacity < 0 {
@@ -197,13 +213,14 @@ func (b *Builder[K, V]) Build() *Cache[K, V] {
 	}
 
 	c := &Cache[K, V]{inner: &cacheInner[K, V]{
-		name:          b.name,
-		capacity:      b.capacity,
-		shards:        shards,
-		weighter:      weighter,
-		filter:        filter,
-		eventListener: b.eventListener,
-		metrics:       metrics,
+		name:            b.name,
+		capacity:        b.capacity,
+		shards:          shards,
+		weighter:        weighter,
+		filter:          filter,
+		eventListener:   b.eventListener,
+		metrics:         metrics,
+		entryFinalizers: b.entryFinalizers,
 	}}
 	c.inner.hashSeed = maphash.MakeSeed()
 
@@ -213,9 +230,9 @@ func (b *Builder[K, V]) Build() *Cache[K, V] {
 	}
 	c.inner.shardList = shardList
 
-	inflights := make([]*inflightManager[K, V], shards)
+	inflights := make([]*InflightManager[K, V], shards)
 	for i := range inflights {
-		inflights[i] = newInflightManager[K, V]()
+		inflights[i] = NewInflightManager[K, V]()
 	}
 	c.inner.inflights = inflights
 	return c
@@ -300,8 +317,16 @@ func (c *Cache[K, V]) InsertWithProperties(key K, value V, props common.Properti
 
 // InsertPiece inserts a piece (e.g. loaded from the disk cache) into the
 // in-memory cache, reusing its record.
+// InsertPiece inserts a piece (e.g. loaded from the disk cache) into the
+// in-memory cache, reusing its record. The entry source is SourceMemory.
 func (c *Cache[K, V]) InsertPiece(piece Piece[K, V]) CacheEntry[K, V] {
 	return c.insertInner(piece.rec, common.SourceMemory)
+}
+
+// InsertPieceWithSource is InsertPiece with an explicit entry source, used
+// by the hybrid cache to report disk-loaded entries as SourceDisk.
+func (c *Cache[K, V]) InsertPieceWithSource(piece Piece[K, V], source common.Source) CacheEntry[K, V] {
+	return c.insertInner(piece.rec, source)
 }
 
 // insertInner runs the emplace flow on the owning shard and fires leave
@@ -340,6 +365,16 @@ func (c *Cache[K, V]) fireGarbages(garbages []garbage[K, V]) {
 // emplace inserts the record into the shard, evicting overflow records.
 // Must be called with the shard lock held exclusively.
 func (s *shard[K, V]) emplace(rec *record[K, V], garbages *[]garbage[K, V]) {
+	// Concurrent fetches can produce a record that is already resident
+	// (e.g. inserted from the disk keeper): reuse it without unlinking and
+	// reinserting, mirroring foyer's emplace fast path.
+	if rec.isInIndexer() {
+		if resident := s.indexer[rec.key]; resident == rec {
+			rec.incRefs(1)
+			return
+		}
+	}
+
 	if rec.isPhantom() {
 		if old := s.removeNoEvict(rec.key); old != nil {
 			if old.isInEviction() {
@@ -347,6 +382,7 @@ func (s *shard[K, V]) emplace(rec *record[K, V], garbages *[]garbage[K, V]) {
 			}
 			s.usage -= old.weight
 			s.entries--
+			s.metrics.MemoryEntries.Dec()
 			*garbages = append(*garbages, garbage[K, V]{event: common.EventReplace, record: old})
 		}
 		rec.incRefs(1)
@@ -470,21 +506,12 @@ func (c *Cache[K, V]) Contains(key K) bool {
 	return s.indexer[key] != nil
 }
 
-// Touch marks the entry with the given key as recently used without
-// creating an external reference. It reports whether the entry exists.
+// Touch reports whether the entry with the given key exists, mirroring
+// foyer's touch (a get_noop): it does not pin the entry, reorder it in the
+// eviction container, or bump algorithm-specific access stats.
 func (c *Cache[K, V]) Touch(key K) bool {
 	hash := c.hash(key)
 	s := c.shardFor(hash)
-	if s.ev.acquireKind() == opMutable {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		rec := s.indexer[key]
-		if rec == nil {
-			return false
-		}
-		s.ev.acquire(rec)
-		return true
-	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.indexer[key] != nil
@@ -513,6 +540,11 @@ func (c *Cache[K, V]) Remove(key K) CacheEntry[K, V] {
 
 	if rec == nil {
 		return CacheEntry[K, V]{}
+	}
+	// Notify the listener out of the lock critical section, mirroring
+	// foyer's remove.
+	if listener := c.inner.eventListener; listener != nil {
+		listener.OnLeave(common.EventRemove, rec.key, rec.value)
 	}
 	return newCacheEntry[K, V](c, rec, common.SourceMemory)
 }
@@ -596,7 +628,9 @@ type entryHandle[K comparable, V any] struct {
 
 func newCacheEntry[K comparable, V any](c *Cache[K, V], rec *record[K, V], source common.Source) CacheEntry[K, V] {
 	h := &entryHandle[K, V]{c: c, rec: rec, source: source}
-	runtime.SetFinalizer(h, (*entryHandle[K, V]).release)
+	if c.inner.entryFinalizers {
+		runtime.SetFinalizer(h, (*entryHandle[K, V]).release)
+	}
 	return CacheEntry[K, V]{h: h}
 }
 
@@ -636,7 +670,9 @@ func (e CacheEntry[K, V]) Clone() CacheEntry[K, V] {
 	}
 	e.h.rec.incRefs(1)
 	h := &entryHandle[K, V]{c: e.h.c, rec: e.h.rec, source: e.h.source}
-	runtime.SetFinalizer(h, (*entryHandle[K, V]).release)
+	if e.h.c.inner.entryFinalizers {
+		runtime.SetFinalizer(h, (*entryHandle[K, V]).release)
+	}
 	return CacheEntry[K, V]{h: h}
 }
 

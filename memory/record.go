@@ -34,11 +34,11 @@ func newRecord[K comparable, V any](key K, value V, props common.Properties, has
 	return &record[K, V]{key: key, value: value, props: props, hash: hash, weight: weight}
 }
 
-func (r *record[K, V]) keyOf() K                  { return r.key }
-func (r *record[K, V]) valueOf() V                { return r.value }
+func (r *record[K, V]) keyOf() K                      { return r.key }
+func (r *record[K, V]) valueOf() V                    { return r.value }
 func (r *record[K, V]) properties() common.Properties { return r.props }
-func (r *record[K, V]) hashOf() uint64            { return r.hash }
-func (r *record[K, V]) weightOf() int             { return r.weight }
+func (r *record[K, V]) hashOf() uint64                { return r.hash }
+func (r *record[K, V]) weightOf() int                 { return r.weight }
 
 func (r *record[K, V]) incRefs(n int64) { r.refs.Add(n) }
 

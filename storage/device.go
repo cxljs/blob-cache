@@ -83,8 +83,8 @@ func (o *FsDeviceOptions) blobFileSize() int64 {
 // `blob_%016d`. It is the counterpart of foyer's `FileDevice` (with
 // blob-file granularity instead of a single preallocated file).
 type fsDevice struct {
-	opts FsDeviceOptions
-	blob int64
+	opts  FsDeviceOptions
+	blob  int64
 	stats *Statistics
 
 	mu    sync.Mutex

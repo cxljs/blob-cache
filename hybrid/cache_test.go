@@ -77,8 +77,7 @@ func TestHybridDiskHitPromotion(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "disk")
 
 	// Cache 1: insert and flush to disk.
-	c1, err := NewBuilder[string, []byte](1<<30, /* big memory: nothing evicted */
-	).WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
+	c1, err := NewBuilder[string, []byte](1<<30 /* big memory: nothing evicted */).WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
 		sb.WithCodec(storage.BytesCodec()).WithBlobFileSize(64 << 10)
 	}).Build()
 	if err != nil {
@@ -92,8 +91,7 @@ func TestHybridDiskHitPromotion(t *testing.T) {
 
 	// Cache 2: reopen the same directory; the value must come back from
 	// disk and be promoted into memory.
-	c2, err := NewBuilder[string, []byte](1<<30,
-	).WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
+	c2, err := NewBuilder[string, []byte](1<<30).WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
 		sb.WithCodec(storage.BytesCodec()).WithBlobFileSize(64 << 10)
 	}).Build()
 	if err != nil {
@@ -105,8 +103,8 @@ func TestHybridDiskHitPromotion(t *testing.T) {
 	if err != nil || string(e.Value()) != "survives-restart" {
 		t.Fatalf("get k after reopen = %v, %v", e, err)
 	}
-	if e.Source() != common.SourceMemory {
-		t.Fatalf("promoted entry source = %v", e.Source())
+	if e.Source() != common.SourceDisk {
+		t.Fatalf("promoted entry source = %v, want Disk", e.Source())
 	}
 	// After promotion the entry lives in memory.
 	if !c2.Memory().Contains("k") {
@@ -117,7 +115,7 @@ func TestHybridDiskHitPromotion(t *testing.T) {
 func TestHybridGetOrFetch(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "disk")
-	c, err := NewBuilder[string, []byte](1 << 20).
+	c, err := NewBuilder[string, []byte](1<<20).
 		WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
 			sb.WithCodec(storage.BytesCodec()).WithBlobFileSize(64 << 10)
 		}).
@@ -152,8 +150,7 @@ func TestHybridGetOrFetch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c2, err := NewBuilder[string, []byte](1<<20,
-	).WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
+	c2, err := NewBuilder[string, []byte](1<<20).WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
 		sb.WithCodec(storage.BytesCodec()).WithBlobFileSize(64 << 10)
 	}).Build()
 	if err != nil {
@@ -172,7 +169,7 @@ func TestHybridGetOrFetch(t *testing.T) {
 func TestHybridGetOrFetchDedup(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "disk")
-	c, err := NewBuilder[string, []byte](1 << 20).
+	c, err := NewBuilder[string, []byte](1<<20).
 		WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
 			sb.WithCodec(storage.BytesCodec())
 		}).
@@ -216,7 +213,7 @@ func TestHybridEvictionOffload(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "disk")
 	c, err := NewBuilder[string, []byte](4). // tiny memory: entries evict quickly
-						WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
+							WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
 			sb.WithCodec(storage.BytesCodec()).WithBlobFileSize(64 << 10)
 		}).
 		Build()
@@ -246,7 +243,7 @@ func TestHybridEvictionOffload(t *testing.T) {
 func TestHybridRemoveAndClear(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "disk")
-	c, err := NewBuilder[string, []byte](1 << 20).
+	c, err := NewBuilder[string, []byte](1<<20).
 		WithStorage(dir, func(sb *storage.StoreBuilder[string, []byte]) {
 			sb.WithCodec(storage.BytesCodec()).WithBlobFileSize(64 << 10)
 		}).

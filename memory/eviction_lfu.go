@@ -80,11 +80,11 @@ type lfu[K comparable, V any] struct {
 	probation *list.List
 	protected *list.List
 
-	windowWeight     int
-	probationWeight  int
-	protectedWeight  int
-	windowCap        int
-	protectedCap     int
+	windowWeight    int
+	probationWeight int
+	protectedWeight int
+	windowCap       int
+	protectedCap    int
 
 	frequencies *countMinSketch
 	step        int
@@ -258,9 +258,8 @@ func (f *lfu[K, V]) acquire(r *record[K, V]) {
 
 	switch st.queue {
 	case lfuQueueWindow:
-		// Move to the MRU position of the window.
-		f.window.Remove(st.elem)
-		st.elem = f.window.PushBack(r)
+		// Move to the MRU position of the window (same list, no alloc).
+		f.window.MoveToBack(st.elem)
 	case lfuQueueProbation:
 		// Promote to the MRU position of the protected queue.
 		f.probation.Remove(st.elem)
@@ -284,9 +283,9 @@ func (f *lfu[K, V]) acquire(r *record[K, V]) {
 			ws.elem = f.probation.PushBack(w)
 		}
 	case lfuQueueProtected:
-		// Move to the MRU position of the protected queue.
-		f.protected.Remove(st.elem)
-		st.elem = f.protected.PushBack(r)
+		// Move to the MRU position of the protected queue (same list, no
+		// alloc).
+		f.protected.MoveToBack(st.elem)
 	}
 }
 

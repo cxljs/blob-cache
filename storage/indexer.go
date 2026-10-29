@@ -1,6 +1,9 @@
 package storage
 
-import "sync"
+import (
+	"slices"
+	"sync"
+)
 
 // EntryAddress locates one entry record on the device, mirroring foyer's
 // `EntryAddress`.
@@ -45,25 +48,37 @@ func (ix *indexer) shard(hash uint64) *indexerShard {
 }
 
 // insertBatch inserts a batch of addresses, returning the overwritten
-// addresses (whose entries became invalid).
+// addresses (whose entries became invalid). The batch is grouped by shard
+// with a stable in-place sort so that each shard lock is held once, no
+// grouping map is allocated, and the caller's ordering is preserved: for
+// duplicate hashes the LAST address must win.
 func (ix *indexer) insertBatch(batch []hashedAddress) []EntryAddress {
 	var overwritten []EntryAddress
-	// Group by shard to hold each shard lock once.
-	byShard := make(map[int][]hashedAddress)
-	for _, ha := range batch {
-		s := int(ha.hash % uint64(len(ix.shards)))
-		byShard[s] = append(byShard[s], ha)
+	if len(batch) == 0 {
+		return nil
 	}
-	for s, items := range byShard {
-		sh := ix.shards[s]
+	if len(ix.shards) > 1 {
+		shards := uint64(len(ix.shards))
+		slices.SortStableFunc(batch, func(a, b hashedAddress) int {
+			return int(a.hash%shards) - int(b.hash%shards)
+		})
+	}
+	for i := 0; i < len(batch); {
+		shardIdx := int(batch[i].hash % uint64(len(ix.shards)))
+		sh := ix.shards[shardIdx]
+		j := i
+		for j < len(batch) && int(batch[j].hash%uint64(len(ix.shards))) == shardIdx {
+			j++
+		}
 		sh.mu.Lock()
-		for _, ha := range items {
+		for _, ha := range batch[i:j] {
 			if old, ok := sh.m[ha.hash]; ok {
 				overwritten = append(overwritten, old)
 			}
 			sh.m[ha.hash] = ha.address
 		}
 		sh.mu.Unlock()
+		i = j
 	}
 	return overwritten
 }

@@ -37,7 +37,7 @@ type lru[K comparable, V any] struct {
 
 	// highPriorityWeight is the weight of the unpinned records currently
 	// in the high priority pool.
-	highPriorityWeight          int
+	highPriorityWeight         int
 	highPriorityWeightCapacity int
 
 	config LruConfig

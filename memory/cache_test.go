@@ -55,8 +55,9 @@ func TestCacheLRUEviction(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		c.Insert(fmt.Sprintf("k%d", i), i)
 	}
-	// Touch k0 so it becomes the most recently used.
-	c.Touch("k0")
+	// Get k0 so it becomes the most recently used (Touch is a pure
+	// existence check and does not reorder, mirroring foyer).
+	c.Get("k0").Release()
 	c.Insert("k4", 4) // evicts k1
 
 	for _, k := range []string{"k0", "k2", "k3", "k4"} {

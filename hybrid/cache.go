@@ -42,8 +42,8 @@ type HybridCache[K comparable, V any] struct {
 	// Close.
 	flushOnClose bool
 
-
-	done    chan struct{}
+	inflights []*memory.InflightManager[K, V]
+	done      chan struct{}
 }
 
 // newHybridCache wires the layers together and starts the pipe pump that
@@ -62,32 +62,43 @@ func newHybridCache[K comparable, V any](
 		metrics:      metrics,
 		policy:       PolicyWriteOnInsertion,
 		flushOnClose: flushOnClose,
-
 		done:         make(chan struct{}),
 	}
 	if store != nil {
 		c.pipe = memory.NewPipe[K, V]()
 		mc.SetPipe(c.pipe)
+		shards := mc.Shards()
+		c.inflights = make([]*memory.InflightManager[K, V], shards)
+		for i := range c.inflights {
+			c.inflights[i] = memory.NewInflightManager[K, V]()
+		}
 		go c.pipePump()
 	}
 	return c
 }
 
 // pipePump moves evicted in-memory pieces into the disk cache write queue.
+// Entries advised to stay in memory (LocationInMem) are dropped here,
+// mirroring foyer's hybrid pipe.
 func (c *HybridCache[K, V]) pipePump() {
 	defer close(c.done)
 	for {
 		pieces := c.pipe.PopAllWait()
-		for _, p := range pieces {
-			c.store.Enqueue(p, false)
-		}
+		c.enqueuePieces(pieces)
 		if c.pipe.IsClosed() {
 			// Drain anything sent concurrently with the close.
-			for _, p := range c.pipe.PopAll() {
-				c.store.Enqueue(p, false)
-			}
+			c.enqueuePieces(c.pipe.PopAll())
 			return
 		}
+	}
+}
+
+func (c *HybridCache[K, V]) enqueuePieces(pieces []memory.Piece[K, V]) {
+	for _, p := range pieces {
+		if p.Properties().Location == common.LocationInMem {
+			continue
+		}
+		c.store.Enqueue(p, false)
 	}
 }
 
@@ -128,43 +139,82 @@ func (c *HybridCache[K, V]) insertToStorage(entry memory.CacheEntry[K, V]) {
 	if c.store == nil || c.policy != PolicyWriteOnInsertion {
 		return
 	}
-	location := entry.Properties().Location
-	if location == common.LocationInMem {
+	if entry.Properties().Location == common.LocationInMem {
 		return
 	}
-	c.store.Enqueue(entry.Piece(), location == common.LocationOnDisk)
+	c.store.Enqueue(entry.Piece(), false)
+}
+
+// inflightFor returns the in-flight manager for the key.
+func (c *HybridCache[K, V]) inflightFor(key K) *memory.InflightManager[K, V] {
+	return c.inflights[c.memory.Hash(key)%uint64(len(c.inflights))]
 }
 
 // Get returns the cached entry with the given key, promoting disk cache
-// hits into the in-memory cache.
+// hits into the in-memory cache. Concurrent misses for the same key are
+// deduplicated through the in-flight manager, mirroring foyer's get.
 func (c *HybridCache[K, V]) Get(ctx context.Context, key K) (HybridCacheEntry[K, V], error) {
 	if entry := c.memory.Get(key); !entry.IsNil() {
 		c.metrics.HybridHit.Inc()
 		return entry, nil
 	}
-	if c.store != nil {
-		load, err := c.store.Load(ctx, key)
-		if err != nil {
-			c.metrics.HybridError.Inc()
-			return HybridCacheEntry[K, V]{}, err
-		}
-		if load.Kind == storage.LoadEntry {
+	if c.store == nil {
+		c.metrics.HybridMiss.Inc()
+		return HybridCacheEntry[K, V]{}, nil
+	}
+
+	m := c.inflightFor(key)
+	call, isLeader := m.Register(key)
+	if !isLeader {
+		ch := call.Follow()
+		<-call.Done()
+		select {
+		case entry := <-ch:
 			c.metrics.HybridHit.Inc()
-			props := common.Properties{}.WithAge(load.Age)
-			// Promote the disk entry into memory with the in-memory hash so
-			// that it shards correctly.
-			piece := memory.NewPiece[K, V](key, load.Value, props, c.memory.Hash(key), c.weight(key, load.Value))
-			return c.memory.InsertPiece(piece), nil
+			return entry, nil
+		default:
+			c.metrics.HybridMiss.Inc()
+			return HybridCacheEntry[K, V]{}, call.Err()
 		}
 	}
-	c.metrics.HybridMiss.Inc()
-	return HybridCacheEntry[K, V]{}, nil
+
+	entry, err, hit := c.loadFromDisk(ctx, key)
+	call.Complete(entry, err)
+	m.Unregister(key, call)
+	switch {
+	case err != nil:
+		c.metrics.HybridError.Inc()
+		return HybridCacheEntry[K, V]{}, err
+	case hit:
+		c.metrics.HybridHit.Inc()
+		return entry, nil
+	default:
+		c.metrics.HybridMiss.Inc()
+		return HybridCacheEntry[K, V]{}, nil
+	}
+}
+
+// loadFromDisk loads the key from the disk cache and promotes a hit into
+// the in-memory cache with SourceDisk and the stored age.
+func (c *HybridCache[K, V]) loadFromDisk(ctx context.Context, key K) (entry HybridCacheEntry[K, V], err error, hit bool) {
+	load, err := c.store.Load(ctx, key)
+	if err != nil {
+		return HybridCacheEntry[K, V]{}, err, false
+	}
+	if load.Kind != storage.LoadEntry {
+		return HybridCacheEntry[K, V]{}, nil, false
+	}
+	props := common.Properties{}.WithAge(load.Age)
+	piece := memory.NewPiece[K, V](key, load.Value, props, c.memory.Hash(key), c.weight(key, load.Value))
+	return c.memory.InsertPieceWithSource(piece, common.SourceDisk), nil, true
 }
 
 // GetOrFetch returns the cached entry with the given key, loading it from
 // the disk cache or fetching it with the given function on a full miss.
 // Concurrent calls for the same key are deduplicated.
 //
+// Disk cache load errors are transparently discarded (they fall through to
+// the fetch function), mirroring foyer: only fetch errors are returned.
 // Fetched entries are inserted into the in-memory cache and written into
 // the disk cache write queue.
 func (c *HybridCache[K, V]) GetOrFetch(ctx context.Context, key K, fetch func() (V, error)) (HybridCacheEntry[K, V], error) {
@@ -178,37 +228,91 @@ func (c *HybridCache[K, V]) GetOrFetchWithProperties(ctx context.Context, key K,
 		c.metrics.HybridHit.Inc()
 		return entry, nil
 	}
-
-	fromDisk := false
-	fetchClosure := func() (V, error) {
-		if c.store != nil {
-			load, err := c.store.Load(ctx, key)
-			if err != nil {
-				var zero V
-				return zero, err
-			}
-			if load.Kind == storage.LoadEntry {
-				fromDisk = true
-				return load.Value, nil
-			}
+	if c.store == nil {
+		// Memory-only mode: dedup and filtering are handled by the memory
+		// cache itself.
+		entry, err := c.memory.GetOrFetchWithProperties(key, fetch, props)
+		if err != nil {
+			c.metrics.HybridError.Inc()
+			return HybridCacheEntry[K, V]{}, err
 		}
-		return fetch()
+		c.metrics.HybridHit.Inc()
+		return entry, nil
 	}
 
-	entry, err := c.memory.GetOrFetchWithProperties(key, fetchClosure, props)
-	if err != nil {
+	m := c.inflightFor(key)
+	call, isLeader := m.Register(key)
+
+	var leaderEntry HybridCacheEntry[K, V]
+	var leaderErr error
+	if isLeader {
+		leaderEntry, leaderErr = c.getOrFetchLeader(ctx, key, fetch, props, call)
+		m.Unregister(key, call)
+		if leaderErr != nil {
+			c.metrics.HybridError.Inc()
+			return HybridCacheEntry[K, V]{}, leaderErr
+		}
+		if leaderEntry.IsNil() {
+			c.metrics.HybridError.Inc()
+			return HybridCacheEntry[K, V]{}, call.Err()
+		}
+		c.metrics.HybridHit.Inc()
+		return leaderEntry, nil
+	}
+
+	// Follower: wait for the leader's result.
+	ch := call.Follow()
+	<-call.Done()
+	select {
+	case entry := <-ch:
+		c.metrics.HybridHit.Inc()
+		return entry, nil
+	default:
 		c.metrics.HybridError.Inc()
+		return HybridCacheEntry[K, V]{}, call.Err()
+	}
+}
+
+// getOrFetchLeader runs the disk-load/fetch chain for the leader of an
+// in-flight call and completes the call for the followers.
+func (c *HybridCache[K, V]) getOrFetchLeader(ctx context.Context, key K, fetch func() (V, error), props common.Properties, call *memory.InflightCall[K, V]) (HybridCacheEntry[K, V], error) {
+	defer func() {
+		if p := recover(); p != nil {
+			call.Complete(HybridCacheEntry[K, V]{}, context.Canceled)
+			panic(p)
+		}
+	}()
+
+	// 1. Disk cache load. Load errors are discarded: they fall through to
+	// the user fetch, mirroring foyer's optional-fetch error handling.
+	if c.store != nil {
+		load, loadErr := c.store.Load(ctx, key)
+		if loadErr == nil && load.Kind == storage.LoadEntry {
+			diskProps := common.Properties{}.WithAge(load.Age)
+			piece := memory.NewPiece[K, V](key, load.Value, diskProps, c.memory.Hash(key), c.weight(key, load.Value))
+			entry := c.memory.InsertPieceWithSource(piece, common.SourceDisk)
+			call.Complete(entry, nil)
+			return entry, nil
+		}
+	}
+
+	// 2. User fetch.
+	value, err := fetch()
+	if err != nil {
+		call.Complete(HybridCacheEntry[K, V]{}, err)
 		return HybridCacheEntry[K, V]{}, err
 	}
 
-	// The in-memory cache handles the per-key deduplication, so the fetch
-	// closure ran at most once: write the fetched value into the disk
-	// cache from here.
-	if c.store != nil && !fromDisk && props.Location != common.LocationInMem {
-		piece := memory.NewPiece[K, V](key, entry.Value(), props.WithAge(common.AgeFresh), 0, c.weight(key, entry.Value()))
-		c.store.Enqueue(piece, props.Location == common.LocationOnDisk)
+	// 3. Insert into the in-memory cache and the disk cache write queue.
+	// The in-flight manager deduplicates concurrent fetches, so this runs
+	// once per key. The memory layer applies its own filter and the
+	// LocationOnDisk phantom handling.
+	entry := c.memory.InsertWithProperties(key, value, props.WithAge(common.AgeFresh))
+	if c.store != nil && props.Location != common.LocationInMem {
+		piece := memory.NewPiece[K, V](key, value, props.WithAge(common.AgeFresh), 0, c.weight(key, value))
+		c.store.Enqueue(piece, false)
 	}
-	c.metrics.HybridHit.Inc()
+	call.Complete(entry, nil)
 	return entry, nil
 }
 
