@@ -51,6 +51,9 @@ type Device interface {
 	DeleteBlob(id BlobID) error
 	// ListBlobIDs returns the ids of all existing blob files.
 	ListBlobIDs() ([]BlobID, error)
+	// ReadAll reads the full content of one blob file (up to the blob
+	// capacity). Used by recovery and reclaim scans.
+	ReadAll(id BlobID) ([]byte, error)
 	// Sync flushes all written data to stable storage.
 	Sync() error
 	// Close releases device resources.
@@ -217,6 +220,35 @@ func (d *fsDevice) ListBlobIDs() ([]BlobID, error) {
 		}
 	}
 	return ids, nil
+}
+
+func (d *fsDevice) ReadAll(id BlobID) ([]byte, error) {
+	f, err := d.file(id)
+	if err != nil {
+		return nil, common.NewError(common.ErrorKindIo, "open blob failed").WithSource(err).
+			WithContext("blob", uint64(id))
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return nil, common.NewError(common.ErrorKindIo, "stat blob failed").WithSource(err).
+			WithContext("blob", uint64(id))
+	}
+	n := st.Size()
+	if n > d.blob {
+		n = d.blob
+	}
+	buf := make([]byte, n)
+	read := 0
+	for read < int(n) {
+		m, err := f.ReadAt(buf[read:], int64(read))
+		read += m
+		if err != nil {
+			break
+		}
+	}
+	d.stats.ReadIOs.Add(1)
+	d.stats.ReadBytes.Add(int64(read))
+	return buf[:read], nil
 }
 
 func (d *fsDevice) Sync() error {

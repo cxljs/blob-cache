@@ -40,12 +40,12 @@ func (l Load[K, V]) IsThrottled() bool { return l.Kind == LoadThrottled }
 type RecoverMode int
 
 const (
-	// RecoverStrict fails the open if any corruption is detected.
-	RecoverStrict RecoverMode = iota
 	// RecoverWary recovers best-effort: scanning stops at the first
 	// corruption of each blob, valid entries are kept. This is the
-	// recommended mode.
-	RecoverWary
+	// default (zero) mode.
+	RecoverWary RecoverMode = iota
+	// RecoverStrict fails the open if any corruption is detected.
+	RecoverStrict
 	// RecoverQuiet recovers best-effort and skips broken files silently.
 	RecoverQuiet
 )

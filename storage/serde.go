@@ -26,7 +26,7 @@ import (
 //	value bytes
 const (
 	blobHeaderSize  = 8
-	entryHeaderSize = 24
+	entryHeaderSize = 28
 )
 
 var (
@@ -86,6 +86,7 @@ func appendEntry(buf []byte, hash uint64, key, value []byte, props common.Proper
 	binary.LittleEndian.PutUint32(h[12:16], uint32(len(key)))
 	binary.LittleEndian.PutUint32(h[16:20], uint32(len(value)))
 	binary.LittleEndian.PutUint32(h[20:24], encodeProps(props))
+	binary.LittleEndian.PutUint32(h[24:28], entryCRC(key, value))
 	buf = append(buf, h[:]...)
 	buf = append(buf, key...)
 	buf = append(buf, value...)
@@ -120,7 +121,7 @@ func parseEntryHeader(buf []byte) (h entryHeader, ok bool) {
 	h.keyLen = keyLen
 	h.valueLen = valueLen
 	h.props = decodeProps(binary.LittleEndian.Uint32(buf[20:24]))
-	h.crc = binary.LittleEndian.Uint32(buf[24-4 : 24])
+	h.crc = binary.LittleEndian.Uint32(buf[24:28])
 	return h, true
 }
 
