@@ -34,6 +34,7 @@ type cacheInner[K comparable, V any] struct {
 	filter        Filter[K, V]
 	eventListener common.EventListener[K, V]
 	pipe          atomic.Pointer[Pipe[K, V]]
+	inflights     []*inflightManager[K, V]
 
 	metrics *common.Metrics
 }
@@ -211,6 +212,12 @@ func (b *Builder[K, V]) Build() *Cache[K, V] {
 		shardList[i] = newShard[K, V](shardCapacityFor(b.capacity, shards, i), b.evictionConfig, metrics)
 	}
 	c.inner.shardList = shardList
+
+	inflights := make([]*inflightManager[K, V], shards)
+	for i := range inflights {
+		inflights[i] = newInflightManager[K, V]()
+	}
+	c.inner.inflights = inflights
 	return c
 }
 
