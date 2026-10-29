@@ -1,0 +1,16 @@
+# Binaries
+*.exe
+*.out
+bazel-*
+
+# Go
+/vendor/
+*.test
+*.prof
+
+# Editor
+.idea/
+.vscode/
+
+# Local rewrite process notes (not part of the source code)
+REWRITE-NOTES.md
