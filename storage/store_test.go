@@ -84,3 +84,60 @@ func TestStoreDestroy(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestStoreLoadBeforeFlush verifies that entries enqueued but not yet
+// flushed are served from the keeper, mirroring foyer's `Store::load`.
+func TestStoreLoadBeforeFlush(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := NewStoreBuilder[string, []byte](dir).WithCodec(BytesCodec()).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close(ctx)
+
+	piece := memory.NewPiece[string, []byte]("pending", []byte("not-yet-flushed"), common.Properties{}, 0, 1)
+	store.Enqueue(piece, false)
+
+	// No Wait here: the entry must be served from the keeper.
+	load, err := store.Load(ctx, "pending")
+	if err != nil || load.Kind != LoadEntry || string(load.Value) != "not-yet-flushed" {
+		t.Fatalf("load pending before flush = %+v, %v", load, err)
+	}
+
+	// Same key with different case is a different key: keeper must not
+	// serve it (keeper lookup is by key, not just hash).
+	load, err = store.Load(ctx, "Pending")
+	if err != nil || !load.IsMiss() {
+		t.Fatalf("load wrong key should miss = %+v, %v", load, err)
+	}
+}
+
+// TestStoreEnqueueThenDeleteSameBatch verifies that an entry that is
+// enqueued and deleted before any flush does not resurrect through its own
+// write: deletes are applied after the writes of the same batch.
+func TestStoreEnqueueThenDeleteSameBatch(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store, err := NewStoreBuilder[string, []byte](dir).WithCodec(BytesCodec()).Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close(ctx)
+
+	piece := memory.NewPiece[string, []byte]("k", []byte("v"), common.Properties{}, 0, 1)
+	store.Enqueue(piece, false)
+	store.Delete("k")
+	store.Wait(ctx)
+
+	load, err := store.Load(ctx, "k")
+	if err != nil || !load.IsMiss() {
+		t.Fatalf("load k after enqueue+delete = %+v, %v", load, err)
+	}
+	// NOTE: the physical write of the entry may already have happened, so
+	// like foyer (without a tombstone log) the entry can reappear after a
+	// restart; only the in-memory index is guaranteed to be clean.
+	if err := store.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

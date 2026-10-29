@@ -13,10 +13,11 @@ import (
 type inflightCall[K comparable, V any] struct {
 	done chan struct{}
 
-	mu      sync.Mutex
-	waiters []chan CacheEntry[K, V]
-	entry   CacheEntry[K, V]
-	err     error
+	mu        sync.Mutex
+	completed bool
+	waiters   []chan CacheEntry[K, V]
+	entry     CacheEntry[K, V]
+	err       error
 }
 
 func newInflightCall[K comparable, V any]() *inflightCall[K, V] {
@@ -24,11 +25,18 @@ func newInflightCall[K comparable, V any]() *inflightCall[K, V] {
 }
 
 // follow registers the caller as a follower of the call and returns the
-// channel delivering the entry.
+// channel delivering the entry. If the call already completed, the result
+// is delivered into the channel immediately, so a follower that lost the
+// race against complete() still receives it.
 func (c *inflightCall[K, V]) follow() chan CacheEntry[K, V] {
 	ch := make(chan CacheEntry[K, V], 1)
 	c.mu.Lock()
-	c.waiters = append(c.waiters, ch)
+	switch {
+	case c.completed && c.err == nil:
+		ch <- c.entry.Clone()
+	case !c.completed:
+		c.waiters = append(c.waiters, ch)
+	}
 	c.mu.Unlock()
 	return ch
 }
@@ -37,6 +45,7 @@ func (c *inflightCall[K, V]) follow() chan CacheEntry[K, V] {
 // be called exactly once.
 func (c *inflightCall[K, V]) complete(entry CacheEntry[K, V], err error) {
 	c.mu.Lock()
+	c.completed = true
 	c.entry = entry
 	c.err = err
 	for _, ch := range c.waiters {

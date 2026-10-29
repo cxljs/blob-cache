@@ -19,19 +19,24 @@ type StoreConfig[K comparable, V any] struct {
 	// Filter is the admission filter applied by the store. The engine may
 	// apply additional limits (e.g. the blob size). Nil admits all.
 	Filter StorageFilter
+	// KeeperShards is the shard count of the write queue. Zero defaults
+	// to 8.
+	KeeperShards int
 	// Metrics receives store-level counters. Optional.
 	Metrics *common.Metrics
 }
 
 // Store is the disk cache that serves as the storage backend of the hybrid
 // cache. It is the counterpart of foyer-storage's `Store`: it hashes keys
-// stably, applies admission filters, routes pieces through the keeper into
-// the engine's write queue, and loads entries back.
+// stably, keeps pending pieces in the keeper so that loads hit before a
+// flush, applies admission filters, and routes pieces into the engine's
+// write queue.
 type Store[K comparable, V any] struct {
 	engine  Engine[K, V]
 	codec   *Codec[K, V]
 	hasher  common.Hasher64
 	filter  StorageFilter
+	keeper  *Keeper[K, V]
 	metrics *common.Metrics
 }
 
@@ -54,6 +59,7 @@ func NewStore[K comparable, V any](cfg StoreConfig[K, V]) (*Store[K, V], error) 
 		codec:   cfg.Codec,
 		hasher:  hasher,
 		filter:  cfg.Filter,
+		keeper:  NewKeeper[K, V](cfg.KeeperShards),
 		metrics: cfg.Metrics,
 	}, nil
 }
@@ -74,7 +80,8 @@ func (s *Store[K, V]) Close(ctx context.Context) error { return s.engine.Close(c
 // Destroy closes the disk cache and removes all data.
 func (s *Store[K, V]) Destroy(ctx context.Context) error { return s.engine.Destroy(ctx) }
 
-// Wait waits until all queued submissions are flushed.
+// Wait waits until all queued submissions are flushed. Pending pieces
+// remain in the keeper until their writes complete.
 func (s *Store[K, V]) Wait(ctx context.Context) { s.engine.Wait(ctx) }
 
 // Stats returns the I/O statistics of the disk cache.
@@ -118,17 +125,37 @@ func (s *Store[K, V]) Enqueue(piece memory.Piece[K, V], force bool) {
 		return
 	}
 
-	// Rebuild the piece with the stable hash.
+	// Rebuild the piece with the stable hash and register it in the
+	// keeper so that loads hit before the flush completes.
 	p := memory.NewPiece[K, V](key, value, piece.Properties(), hash, piece.Weight())
-	s.engine.Enqueue(p, estimated)
+	ref := s.keeper.Insert(p)
+	if pe, ok := s.engine.(interface {
+		EnqueuePrepared(ref *PieceRef[K, V], key, value []byte, estimatedSize int)
+	}); ok {
+		// The engine reuses the payload encoded above instead of encoding
+		// it a second time.
+		pe.EnqueuePrepared(ref, kb, vb, estimated)
+		return
+	}
+	s.engine.Enqueue(ref, estimated)
 }
 
 // Load loads the cached entry with the given key from the disk cache.
+// Entries that are enqueued but not yet flushed are served from the
+// keeper, mirroring foyer.
 func (s *Store[K, V]) Load(ctx context.Context, key K) (Load[K, V], error) {
 	hash, _, err := s.hashOf(key)
 	if err != nil {
 		return Load[K, V]{}, err
 	}
+
+	if piece, ok := s.keeper.Get(hash, key); ok {
+		if s.metrics != nil {
+			s.metrics.StorageHit.Inc()
+		}
+		return Load[K, V]{Kind: LoadEntry, Key: key, Value: piece.Value(), Age: common.AgeYoung}, nil
+	}
+
 	load, err := s.engine.Load(ctx, hash)
 	if err != nil {
 		if s.metrics != nil {
@@ -275,7 +302,6 @@ func (b *StoreBuilder[K, V]) Build() (*Store[K, V], error) {
 		Picker:        b.picker,
 		RecoverMode:   b.recoverMode,
 		IndexerShards: b.indexerShards,
-		KeeperShards:  b.keeperShards,
 		Metrics:       b.metrics,
 	})
 	if err != nil {
@@ -283,10 +309,11 @@ func (b *StoreBuilder[K, V]) Build() (*Store[K, V], error) {
 		return nil, err
 	}
 	return NewStore[K, V](StoreConfig[K, V]{
-		Engine:  engine,
-		Codec:   codec,
-		Hasher:  b.hasher,
-		Filter:  b.filter,
-		Metrics: b.metrics,
+		Engine:       engine,
+		Codec:        codec,
+		Hasher:       b.hasher,
+		Filter:       b.filter,
+		KeeperShards: b.keeperShards,
+		Metrics:      b.metrics,
 	})
 }

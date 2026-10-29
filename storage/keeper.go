@@ -14,12 +14,27 @@ import (
 type PieceRef[K comparable, V any] struct {
 	Piece memory.Piece[K, V]
 
+	keeper  *Keeper[K, V]
 	current *atomic.Bool
 }
 
 // IsCurrent reports whether this reference owns the current keeper
 // registration.
 func (r *PieceRef[K, V]) IsCurrent() bool { return r.current.Load() }
+
+// Remove drops the keeper registration owned by this reference. It is
+// called by the engine after the piece has been flushed to the device.
+func (r *PieceRef[K, V]) Remove() {
+	if !r.current.Load() {
+		return
+	}
+	sh := r.keeper.shard(r.Piece.Hash())
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if p, ok := sh.m[r.Piece.Key()]; ok && p.current == r.current {
+		delete(sh.m, r.Piece.Key())
+	}
+}
 
 // keeperShard is one shard of the keeper.
 type keeperShard[K comparable, V any] struct {
@@ -70,7 +85,7 @@ func (k *Keeper[K, V]) Insert(piece memory.Piece[K, V]) *PieceRef[K, V] {
 	sh.m[piece.Key()] = &pendingEntry[K, V]{current: current, piece: piece}
 	sh.mu.Unlock()
 
-	return &PieceRef[K, V]{Piece: piece, current: current}
+	return &PieceRef[K, V]{Piece: piece, keeper: k, current: current}
 }
 
 // Get returns the pending piece for the key, if any.
@@ -92,17 +107,4 @@ func (k *Keeper[K, V]) Contains(hash uint64, key K) bool {
 	defer sh.mu.Unlock()
 	_, ok := sh.m[key]
 	return ok
-}
-
-// Remove drops the registration owned by the given piece reference.
-func (k *Keeper[K, V]) Remove(ref *PieceRef[K, V]) {
-	if !ref.current.Load() {
-		return
-	}
-	sh := k.shard(ref.Piece.Hash())
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	if p, ok := sh.m[ref.Piece.Key()]; ok && p.current == ref.current {
-		delete(sh.m, ref.Piece.Key())
-	}
 }

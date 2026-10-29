@@ -6,7 +6,6 @@ import (
 	"sync"
 
 	"blob-cache/common"
-	"blob-cache/memory"
 )
 
 // BlobPicker picks the next blob to reclaim, mirroring foyer's
@@ -90,8 +89,6 @@ type BlobEngineConfig[K comparable, V any] struct {
 	RecoverMode RecoverMode
 	// IndexerShards is the shard count of the in-memory indexer.
 	IndexerShards int
-	// KeeperShards is the shard count of the write queue.
-	KeeperShards int
 	// Metrics receives engine-level counters. Optional.
 	Metrics *common.Metrics
 }
@@ -105,9 +102,12 @@ const (
 )
 
 type submission[K comparable, V any] struct {
-	kind   subKind
+	kind subKind
+	// insert fields: the piece reference and its pre-encoded payload.
 	ref    *PieceRef[K, V]
 	hash   uint64
+	key    []byte
+	value  []byte
 	size   int
 	waitCh chan struct{}
 }
@@ -129,7 +129,6 @@ type blobEngine[K comparable, V any] struct {
 	cfg      BlobEngineConfig[K, V]
 	dev      Device
 	ix       *indexer
-	keeper   *Keeper[K, V]
 	maxBlobs int
 	picker   BlobPicker
 	metrics  *common.Metrics
@@ -140,6 +139,10 @@ type blobEngine[K comparable, V any] struct {
 	closed   bool
 	closeErr error
 	done     chan struct{}
+
+	// scratch is a flusher-goroutine-local serialization buffer, reused
+	// across records to avoid one allocation per entry.
+	scratch []byte
 
 	// Flusher-owned state. Guarded by mu while the flusher is not running
 	// (i.e. during recovery and close).
@@ -181,7 +184,6 @@ func NewBlobEngine[K comparable, V any](cfg BlobEngineConfig[K, V]) (Engine[K, V
 		cfg:      cfg,
 		dev:      cfg.Device,
 		ix:       newIndexer(cfg.IndexerShards),
-		keeper:   NewKeeper[K, V](cfg.KeeperShards),
 		maxBlobs: int(maxBlobs),
 		picker:   picker,
 		metrics:  cfg.Metrics,
@@ -272,24 +274,32 @@ func (e *blobEngine[K, V]) recover(mode RecoverMode) error {
 		// Wary and Quiet modes keep the valid prefix of a corrupted blob.
 	}
 
-	// Continue writing into the blob with the largest id, or start a new
-	// one.
-	for id := range e.blobs {
-		if id > e.current {
+	// Continue writing into the valid blob with the largest id; blobs
+	// without a valid header cannot be appended to (their content layout
+	// is unknown), so they are left for the reclaimer instead.
+	for id, info := range e.blobs {
+		if info.Written >= int64(blobHeaderSize) && id > e.current {
 			e.current = id
 		}
 	}
-	if len(e.blobs) == 0 {
-		if err := e.openBlob(0); err != nil {
-			return err
+	if e.current == 0 && (len(e.blobs) == 0 || e.blobs[e.current] == nil || e.blobs[e.current].Written < int64(blobHeaderSize)) {
+		if len(e.blobs) > 0 {
+			// All existing blobs are unusable; start afresh after them.
+			var maxID BlobID
+			for id := range e.blobs {
+				if id > maxID {
+					maxID = id
+				}
+			}
+			return e.openBlob(maxID + 1)
 		}
-	} else {
-		e.offset = e.blobs[e.current].Written
-		if e.offset >= e.dev.BlobSize() {
-			// The latest blob is full; the flusher rotates before the
-			// first write.
-			e.offset = e.dev.BlobSize()
-		}
+		return e.openBlob(0)
+	}
+	e.offset = e.blobs[e.current].Written
+	if e.offset >= e.dev.BlobSize() {
+		// The latest blob is full; the flusher rotates before the first
+		// write.
+		e.offset = e.dev.BlobSize()
 	}
 	return nil
 }
@@ -340,50 +350,43 @@ func (e *blobEngine[K, V]) run() {
 	}
 }
 
-// take is handled inline in run; handle processes one batch of
-// submissions.
+// handle processes one batch of submissions: inserts are encoded once and
+// written, deletes are applied after the writes (so that an entry that is
+// enqueued and deleted within the same batch is not resurrected by its own
+// write), and waiters are unblocked last.
 func (e *blobEngine[K, V]) handle(batch []submission[K, V]) error {
 	var records []rawRecord[K, V]
+	var deletes []uint64
 	var waitChs []chan struct{}
 	for _, s := range batch {
 		switch s.kind {
 		case subInsert:
-			p := s.ref.Piece
-			key, err := e.cfg.Codec.EncodeKey(p.Key())
-			if err != nil {
+			if len(s.key)+len(s.value) > maxEntrySize(e.dev.BlobSize())-entryHeaderSize {
 				e.failEnqueue()
-				e.keeper.Remove(s.ref)
-				continue
-			}
-			value, err := e.cfg.Codec.EncodeValue(p.Value())
-			if err != nil {
-				e.failEnqueue()
-				e.keeper.Remove(s.ref)
-				continue
-			}
-			if entryLen(len(key), len(value)) > maxEntrySize(e.dev.BlobSize()) {
-				e.failEnqueue()
-				e.keeper.Remove(s.ref)
+				s.ref.Remove()
 				continue
 			}
 			records = append(records, rawRecord[K, V]{
-				hash:  p.Hash(),
-				props: p.Properties(),
-				key:   key,
-				value: value,
+				hash:  s.hash,
+				props: s.ref.Piece.Properties(),
+				key:   s.key,
+				value: s.value,
 				ref:   s.ref,
 			})
 		case subDelete:
-			if old, ok := e.ix.remove(s.hash); ok {
-				if bi, ok := e.blobs[old.Blob]; ok {
-					bi.Invalid += int64(old.Len)
-				}
-			}
+			deletes = append(deletes, s.hash)
 		case subWait:
 			waitChs = append(waitChs, s.waitCh)
 		}
 	}
 	err := e.writeRecords(records)
+	for _, hash := range deletes {
+		if old, ok := e.ix.remove(hash); ok {
+			if bi, ok := e.blobs[old.Blob]; ok {
+				bi.Invalid += int64(old.Len)
+			}
+		}
+	}
 	// Unblock waiters only after the batch has been processed.
 	for _, ch := range waitChs {
 		close(ch)
@@ -401,16 +404,16 @@ func (e *blobEngine[K, V]) writeRecords(records []rawRecord[K, V]) error {
 		if err := e.ensureSpace(int64(entryLen(len(r.key), len(r.value)))); err != nil {
 			return err
 		}
-		buf := appendEntry(nil, r.hash, r.key, r.value, r.props)
-		if err := e.dev.Write(e.current, buf, e.offset); err != nil {
+		e.scratch = appendEntry(e.scratch[:0], r.hash, r.key, r.value, r.props)
+		if err := e.dev.Write(e.current, e.scratch, e.offset); err != nil {
 			return err
 		}
 		batch = append(batch, hashedAddress{hash: r.hash, address: EntryAddress{
 			Blob:   e.current,
 			Offset: e.offset,
-			Len:    int32(len(buf)),
+			Len:    int32(len(e.scratch)),
 		}})
-		e.offset += int64(len(buf))
+		e.offset += int64(len(e.scratch))
 		e.blobs[e.current].Written = e.offset
 		if r.ref != nil {
 			writtenRefs = append(writtenRefs, r.ref)
@@ -423,7 +426,7 @@ func (e *blobEngine[K, V]) writeRecords(records []rawRecord[K, V]) error {
 		}
 	}
 	for _, ref := range writtenRefs {
-		e.keeper.Remove(ref)
+		ref.Remove()
 	}
 
 	// Reclaim over-capacity blobs after a rotation.
@@ -513,16 +516,16 @@ func (e *blobEngine[K, V]) vacuum(victim BlobID) error {
 			if e.offset+total > blobSize {
 				break
 			}
-			buf := appendEntry(nil, h.hash, key, value, h.props)
-			if err := e.dev.Write(e.current, buf, e.offset); err != nil {
+			e.scratch = appendEntry(e.scratch[:0], h.hash, key, value, h.props)
+			if err := e.dev.Write(e.current, e.scratch, e.offset); err != nil {
 				return err
 			}
 			batch = append(batch, hashedAddress{hash: h.hash, address: EntryAddress{
 				Blob:   e.current,
 				Offset: e.offset,
-				Len:    int32(len(buf)),
+				Len:    int32(len(e.scratch)),
 			}})
-			e.offset += int64(len(buf))
+			e.offset += int64(len(e.scratch))
 			e.blobs[e.current].Written = e.offset
 			reinserted++
 		}
@@ -550,15 +553,42 @@ func (e *blobEngine[K, V]) failEnqueue() {
 	}
 }
 
-// Enqueue implements Engine.
-func (e *blobEngine[K, V]) Enqueue(piece memory.Piece[K, V], estimatedSize int) {
+// Enqueue implements Engine. The payload is encoded here; engines used
+// through the Store should prefer EnqueuePrepared to avoid encoding twice.
+func (e *blobEngine[K, V]) Enqueue(piece *PieceRef[K, V], estimatedSize int) {
+	key, err := e.cfg.Codec.EncodeKey(piece.Piece.Key())
+	if err != nil {
+		e.failEnqueue()
+		piece.Remove()
+		return
+	}
+	value, err := e.cfg.Codec.EncodeValue(piece.Piece.Value())
+	if err != nil {
+		e.failEnqueue()
+		piece.Remove()
+		return
+	}
+	e.EnqueuePrepared(piece, key, value, estimatedSize)
+}
+
+// EnqueuePrepared enqueues a piece with its already encoded payload. It is
+// used by the Store, which encodes the payload once for hashing and size
+// estimation.
+func (e *blobEngine[K, V]) EnqueuePrepared(piece *PieceRef[K, V], key, value []byte, estimatedSize int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.closed {
+		piece.Remove()
 		return
 	}
-	ref := e.keeper.Insert(piece)
-	e.subs = append(e.subs, submission[K, V]{kind: subInsert, ref: ref, hash: piece.Hash(), size: estimatedSize})
+	e.subs = append(e.subs, submission[K, V]{
+		kind:  subInsert,
+		ref:   piece,
+		hash:  piece.Piece.Hash(),
+		key:   key,
+		value: value,
+		size:  estimatedSize,
+	})
 	e.cond.Broadcast()
 }
 

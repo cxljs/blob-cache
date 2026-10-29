@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"blob-cache/common"
-	"blob-cache/memory"
 )
 
 // LoadKind classifies the result of a disk cache load.
@@ -100,9 +99,11 @@ type Engine[K comparable, V any] interface {
 	// Filter reports whether the entry with the given hash and estimated
 	// size can be admitted.
 	Filter(hash uint64, estimatedSize int) StorageFilterResult
-	// Enqueue pushes a piece into the write queue. The piece is flushed
-	// asynchronously.
-	Enqueue(piece memory.Piece[K, V], estimatedSize int)
+	// Enqueue pushes a piece reference (registered in the keeper by the
+	// store) into the write queue. The piece is flushed asynchronously;
+	// after a successful flush the engine removes the keeper registration
+	// via PieceRef.Remove.
+	Enqueue(piece *PieceRef[K, V], estimatedSize int)
 	// Load loads the cached entry with the given hash.
 	Load(ctx context.Context, hash uint64) (Load[K, V], error)
 	// Delete removes the cached entry with the given hash from the index.

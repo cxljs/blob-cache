@@ -10,7 +10,7 @@ import (
 	"blob-cache/memory"
 )
 
-func newTestEngine(t *testing.T, dir string, blobSize int64, totalCapacity int64) (Engine[string, []byte], Device) {
+func newTestEngine(t *testing.T, dir string, blobSize int64, totalCapacity int64) (Engine[string, []byte], Device, *Keeper[string, []byte]) {
 	t.Helper()
 	dev, err := OpenFsDevice(FsDeviceOptions{Dir: dir, BlobFileSize: blobSize})
 	if err != nil {
@@ -24,10 +24,10 @@ func newTestEngine(t *testing.T, dir string, blobSize int64, totalCapacity int64
 	if err != nil {
 		t.Fatal(err)
 	}
-	return e, dev
+	return e, dev, NewKeeper[string, []byte](1)
 }
 
-func enqueuePiece(t *testing.T, e Engine[string, []byte], codec *Codec[string, []byte], key string, value []byte, age common.Age) {
+func enqueuePiece(t *testing.T, e Engine[string, []byte], keeper *Keeper[string, []byte], codec *Codec[string, []byte], key string, value []byte, age common.Age) {
 	t.Helper()
 	kb, err := codec.EncodeKey(key)
 	if err != nil {
@@ -35,7 +35,8 @@ func enqueuePiece(t *testing.T, e Engine[string, []byte], codec *Codec[string, [
 	}
 	hash := common.DefaultHashBuilder.Hash64(kb)
 	p := memory.NewPiece[string, []byte](key, value, common.Properties{}.WithAge(age), hash, 1)
-	e.Enqueue(p, entryHeaderSize+len(kb)+len(value))
+	ref := keeper.Insert(p)
+	e.Enqueue(ref, entryHeaderSize+len(kb)+len(value))
 }
 
 func hashOf(t *testing.T, codec *Codec[string, []byte], key string) uint64 {
@@ -50,11 +51,11 @@ func hashOf(t *testing.T, codec *Codec[string, []byte], key string) uint64 {
 func TestBlobEngineBasic(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "cache")
-	e, dev := newTestEngine(t, dir, 64<<10, 8*64<<10)
+	e, dev, keeper := newTestEngine(t, dir, 64<<10, 8*64<<10)
 	codec := BytesCodec()
 
-	enqueuePiece(t, e, codec, "k1", []byte("value-1"), common.AgeFresh)
-	enqueuePiece(t, e, codec, "k2", []byte("value-2"), common.AgeYoung)
+	enqueuePiece(t, e, keeper, codec, "k1", []byte("value-1"), common.AgeFresh)
+	enqueuePiece(t, e, keeper, codec, "k2", []byte("value-2"), common.AgeYoung)
 	e.Wait(ctx)
 
 	if !e.MayContains(hashOf(t, codec, "k1")) {
@@ -73,7 +74,7 @@ func TestBlobEngineBasic(t *testing.T) {
 	}
 
 	// Overwrite k1 with a new value.
-	enqueuePiece(t, e, codec, "k1", []byte("value-1-new"), common.AgeFresh)
+	enqueuePiece(t, e, keeper, codec, "k1", []byte("value-1-new"), common.AgeFresh)
 	e.Wait(ctx)
 	load, err = e.Load(ctx, hashOf(t, codec, "k1"))
 	if err != nil || string(load.Value) != "value-1-new" {
@@ -94,7 +95,7 @@ func TestBlobEngineBasic(t *testing.T) {
 	dev.Close()
 
 	// Recovery: reopen and load everything again.
-	e2, dev2 := newTestEngine(t, dir, 64<<10, 8*64<<10)
+	e2, dev2, _ := newTestEngine(t, dir, 64<<10, 8*64<<10)
 	defer dev2.Close()
 	load, err = e2.Load(ctx, hashOf(t, codec, "k1"))
 	if err != nil || string(load.Value) != "value-1-new" {
@@ -114,7 +115,7 @@ func TestBlobEngineReclaim(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "cache")
 	// 4 blobs of 1 KiB: 4 KiB total capacity.
-	e, dev := newTestEngine(t, dir, 1024, 4*1024)
+	e, dev, keeper := newTestEngine(t, dir, 1024, 4*1024)
 	defer dev.Close()
 	codec := BytesCodec()
 
@@ -124,7 +125,7 @@ func TestBlobEngineReclaim(t *testing.T) {
 		for j := range value {
 			value[j] = byte(i)
 		}
-		enqueuePiece(t, e, codec, key, value, common.AgeFresh)
+		enqueuePiece(t, e, keeper, codec, key, value, common.AgeFresh)
 	}
 	e.Wait(ctx)
 
@@ -156,11 +157,11 @@ func TestBlobEngineReclaim(t *testing.T) {
 func TestBlobEngineCorruptTail(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "cache")
-	e, dev := newTestEngine(t, dir, 64<<10, 8*64<<10)
+	e, dev, keeper := newTestEngine(t, dir, 64<<10, 8*64<<10)
 	codec := BytesCodec()
 
-	enqueuePiece(t, e, codec, "a", []byte("aa"), common.AgeFresh)
-	enqueuePiece(t, e, codec, "b", []byte("bb"), common.AgeFresh)
+	enqueuePiece(t, e, keeper, codec, "a", []byte("aa"), common.AgeFresh)
+	enqueuePiece(t, e, keeper, codec, "b", []byte("bb"), common.AgeFresh)
 	e.Wait(ctx)
 	if err := e.Close(ctx); err != nil {
 		t.Fatal(err)
@@ -178,7 +179,7 @@ func TestBlobEngineCorruptTail(t *testing.T) {
 	f.Close()
 
 	// Wary recovery keeps the valid entries.
-	e2, dev2 := newTestEngine(t, dir, 64<<10, 8*64<<10)
+	e2, dev2, _ := newTestEngine(t, dir, 64<<10, 8*64<<10)
 	defer dev2.Close()
 	load, err := e2.Load(ctx, hashOf(t, codec, "a"))
 	if err != nil || string(load.Value) != "aa" {
@@ -192,10 +193,10 @@ func TestBlobEngineCorruptTail(t *testing.T) {
 
 func TestBlobEngineCorruptStrict(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "cache")
-	e, dev := newTestEngine(t, dir, 64<<10, 8*64<<10)
+	e, dev, keeper := newTestEngine(t, dir, 64<<10, 8*64<<10)
 	codec := BytesCodec()
 
-	enqueuePiece(t, e, codec, "a", []byte("aa"), common.AgeFresh)
+	enqueuePiece(t, e, keeper, codec, "a", []byte("aa"), common.AgeFresh)
 	e.Wait(context.Background())
 	if err := e.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -227,17 +228,52 @@ func TestBlobEngineCorruptStrict(t *testing.T) {
 	}
 }
 
+// TestBlobEngineRecoverBadHeaderOnlyBlob ensures the engine does not
+// continue appending into a blob whose header is invalid (its content
+// layout is unknown): the first write must go to a fresh blob so that a
+// later recovery does not lose the data.
+func TestBlobEngineRecoverBadHeaderOnlyBlob(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "cache")
+
+	// A blob file with garbage instead of a valid header.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, BlobFileName(3)), []byte("this is not a blob file at all......."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e, dev, keeper := newTestEngine(t, dir, 64<<10, 8*64<<10)
+	codec := BytesCodec()
+	enqueuePiece(t, e, keeper, codec, "a", []byte("aa"), common.AgeFresh)
+	e.Wait(ctx)
+	if err := e.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dev.Close()
+
+	// Reopen: the entry must recover (it was written to a fresh blob with
+	// a valid header).
+	e2, dev2, _ := newTestEngine(t, dir, 64<<10, 8*64<<10)
+	defer dev2.Close()
+	load, err := e2.Load(ctx, hashOf(t, codec, "a"))
+	if err != nil || string(load.Value) != "aa" {
+		t.Fatalf("load a after recovery = %+v, %v", load, err)
+	}
+}
+
 func TestBlobEngineSizeFilter(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "cache")
-	e, dev := newTestEngine(t, dir, 4096, 8*4096)
+	e, dev, keeper := newTestEngine(t, dir, 4096, 8*4096)
 	defer dev.Close()
 	codec := BytesCodec()
 
 	// An entry larger than the blob capacity is rejected by the built-in
 	// size filter.
 	big := make([]byte, 8192)
-	enqueuePiece(t, e, codec, "big", big, common.AgeFresh)
+	enqueuePiece(t, e, keeper, codec, "big", big, common.AgeFresh)
 	e.Wait(ctx)
 	if load, err := e.Load(ctx, hashOf(t, codec, "big")); err != nil || !load.IsMiss() {
 		t.Fatalf("oversized entry should be rejected: %+v, %v", load, err)

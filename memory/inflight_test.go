@@ -67,6 +67,51 @@ func TestGetOrFetchDedup(t *testing.T) {
 	}
 }
 
+// TestInflightLateFollower verifies that a follower registering after the
+// leader completed (but before the call was unregistered) still receives
+// the entry instead of an empty result.
+func TestInflightLateFollower(t *testing.T) {
+	c := newTestCache(t, 10)
+	m := newInflightManager[string, int]()
+	call, isLeader := m.register("k")
+	if !isLeader {
+		t.Fatal("expected to be the leader")
+	}
+
+	entry := c.Insert("k", 42)
+	call.complete(entry, nil)
+
+	// A follower that arrives after completion.
+	ch := call.follow()
+	select {
+	case e := <-ch:
+		if e.Value() != 42 {
+			t.Fatalf("late follower value = %d, want 42", e.Value())
+		}
+		e.Release()
+	default:
+		t.Fatal("late follower received nothing")
+	}
+
+	// A follower that arrived before completion with an error gets the
+	// error, not an entry.
+	call2, isLeader := m.register("e")
+	if !isLeader {
+		t.Fatal("expected to be the leader")
+	}
+	ch2 := call2.follow()
+	call2.complete(CacheEntry[string, int]{}, fmt.Errorf("boom"))
+	<-call2.done
+	select {
+	case e := <-ch2:
+		t.Fatalf("error call delivered an entry: %v", e.Value())
+	default:
+	}
+	m.unregister("k", call)
+	m.unregister("e", call2)
+	entry.Release()
+}
+
 func TestGetOrFetchPhantom(t *testing.T) {
 	p := NewPipe[string, int]()
 	c := newTestCache(t, 10, func(b *Builder[string, int]) {
