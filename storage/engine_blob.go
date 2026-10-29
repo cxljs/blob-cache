@@ -668,12 +668,30 @@ func (e *blobEngine[K, V]) Close(ctx context.Context) error {
 	return e.closeErr
 }
 
-// Destroy implements Engine.
+// Destroy implements Engine. It removes all data and resets the engine so
+// that it keeps working with an empty device (used by hybrid clear).
 func (e *blobEngine[K, V]) Destroy(ctx context.Context) error {
 	if err := e.Close(ctx); err != nil {
 		return err
 	}
-	return e.dev.Destroy()
+	if err := e.dev.Destroy(); err != nil {
+		return err
+	}
+
+	e.ix.clear()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.blobs = make(map[BlobID]*BlobInfo)
+	e.current = 0
+	e.offset = 0
+	e.closed = false
+	e.closeErr = nil
+	e.done = make(chan struct{})
+	if err := e.openBlob(0); err != nil {
+		return err
+	}
+	go e.run()
+	return nil
 }
 
 // Stats implements Engine.

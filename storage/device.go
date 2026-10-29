@@ -178,6 +178,11 @@ func (d *fsDevice) Write(id BlobID, buf []byte, offset int64) error {
 func (d *fsDevice) BlobSize() int64 { return d.blob }
 
 func (d *fsDevice) CreateBlob(id BlobID) error {
+	// Recreate the directory if it was removed (e.g. by Destroy).
+	if err := os.MkdirAll(d.opts.Dir, 0o755); err != nil {
+		return common.NewError(common.ErrorKindIo, "create device dir failed").WithSource(err).
+			WithContext("dir", d.opts.Dir)
+	}
 	f, err := os.OpenFile(d.path(id), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return common.NewError(common.ErrorKindIo, "create blob failed").WithSource(err).

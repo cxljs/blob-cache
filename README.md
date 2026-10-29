@@ -35,11 +35,32 @@ filters...) while following Go idioms.
 
 See `examples/` for runnable examples.
 
+Hybrid cache with an in-memory layer and a disk (blob) layer:
+
 ```go
-hybridCache, err := hybrid.NewBuilder[string, []byte]().
-    WithMemoryOptions(memory.WithCapacity(64 * 1024 * 1024)).
-    WithStorageOptions(storage.WithDir("./cache-data")).
+cache, err := hybrid.NewBuilder[string, []byte](4*1024*1024).
+    WithStorage("./cache-data", func(sb *storage.StoreBuilder[string, []byte]) {
+        sb.WithCodec(storage.BytesCodec()).
+            WithBlobFileSize(16 << 20).
+            WithTotalCapacity(64 << 20)
+    }).
     Build()
+
+cache.Insert("key", []byte("value"))
+entry, err := cache.GetOrFetch(ctx, "key", fetchFromSource)
+defer cache.Close(ctx)
+```
+
+In-memory cache with a pluggable eviction algorithm:
+
+```go
+cache := memory.NewBuilder[string, string](1024).
+    WithEvictionConfig(memory.DefaultLfuConfig()). // or Lru/Fifo/S3Fifo/Sieve
+    Build()
+
+entry := cache.Insert("key", "value")
+got := cache.Get("key")
+got.Release()
 ```
 
 ## License
