@@ -1,6 +1,6 @@
 # blob-cache 重写过程记录
 
-> 本文档是 foyer（Rust，v0.22.6）→ blob-cache（Go）重写过程的工作记录，**不属于项目源码，不提交到 git**（已加入 `.gitignore`）。目的是向审阅者说明重写的思路、决策与取舍。
+> 本文档是 foyer（Rust，v0.22.6）→ blob-cache（Go）重写过程的工作记录，目的是向审阅者说明重写的思路、决策与取舍。曾短期加入 `.gitignore` 不入库，后按项目要求随 `docs: add foyer-to-Go rewrite process notes` 提交并推送到 GitHub，随源码一同维护。
 
 ## 1. 背景与总体思路
 
