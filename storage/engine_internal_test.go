@@ -147,6 +147,49 @@ func TestVacuumCurrentBlobGuard(t *testing.T) {
 	}
 }
 
+// TestVacuumDropsDeletedEntries is a regression test: entries deleted from
+// the indexer must NOT be resurrected when their blob is vacuumed (the
+// vacuum used to treat indexer-missing entries as live orphans).
+func TestVacuumDropsDeletedEntries(t *testing.T) {
+	ctx := context.Background()
+	eng, err := NewBlobEngine(BlobEngineConfig[string, string]{
+		Device: mustDevice(t, t.TempDir(), 4096),
+		Codec:  GobCodec[string, string](),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := eng.(*blobEngine[string, string])
+	if err := e.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	codec := e.cfg.Codec
+	kb, _ := codec.EncodeKey("k")
+	v1, _ := codec.EncodeValue("v1")
+	if err := e.writeRecord(nil, 42, kb, v1, common.Properties{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a delete: the indexer entry is removed while the on-disk
+	// copy stays behind.
+	if _, ok := e.ix.remove(42); !ok {
+		t.Fatal("setup: expected the entry to be indexed")
+	}
+
+	// Rotate to a fresh blob so the victim is not the current one, then
+	// vacuum: the deleted entry's copy must be dropped, not resurrected.
+	if err := e.openBlob(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.vacuum(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := e.ix.get(42); ok {
+		t.Fatal("deleted entry was resurrected by the vacuum")
+	}
+}
+
 // TestEngineDestroyWithCancelledContext ensures Destroy joins the flusher
 // even when the context is already cancelled, and leaves a working engine.
 func TestEngineDestroyWithCancelledContext(t *testing.T) {

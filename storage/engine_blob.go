@@ -551,9 +551,13 @@ func (e *blobEngine[K, V]) vacuum(victim BlobID) error {
 		}
 
 		for hash, sv := range last {
-			// Skip entries superseded by a newer write outside the victim
-			// (the indexer still holds the pre-vacuum state here).
-			if addr, ok := e.ix.get(hash); ok && addr.Blob != victim {
+			// Only entries the indexer still points INTO the victim are
+			// live. Entries missing from the indexer were deleted (their
+			// deletion is authoritative without a tombstone log) and
+			// entries pointing elsewhere were superseded by a newer write:
+			// both are dropped, mirroring foyer's reclaimer.
+			addr, ok := e.ix.get(hash)
+			if !ok || addr.Blob != victim {
 				continue
 			}
 			total := int64(entryLen(len(sv.key), len(sv.value)))
