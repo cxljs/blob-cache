@@ -24,7 +24,7 @@ func newInflightCall[K comparable, V any]() *InflightCall[K, V] {
 	return &InflightCall[K, V]{done: make(chan struct{})}
 }
 
-// follow registers the caller as a follower of the call and returns the
+// Follow registers the caller as a follower of the call and returns the
 // channel delivering the entry. If the call already completed, the result
 // is delivered into the channel immediately, so a follower that lost the
 // race against complete() still receives it.
@@ -41,7 +41,7 @@ func (c *InflightCall[K, V]) Follow() chan CacheEntry[K, V] {
 	return ch
 }
 
-// complete delivers the entry to all followers and unblocks them. It must
+// Complete delivers the entry to all followers and unblocks them. It must
 // be called exactly once.
 func (c *InflightCall[K, V]) Complete(entry CacheEntry[K, V], err error) {
 	c.mu.Lock()
@@ -68,7 +68,7 @@ func (c *InflightCall[K, V]) Err() error {
 	return c.err
 }
 
-// inflightManager dedups concurrent fetches for the same key within one
+// InflightManager dedups concurrent fetches for the same key within one
 // shard, mirroring foyer's `InflightManager`.
 type InflightManager[K comparable, V any] struct {
 	mu sync.Mutex
@@ -79,7 +79,7 @@ func NewInflightManager[K comparable, V any]() *InflightManager[K, V] {
 	return &InflightManager[K, V]{m: make(map[K]*InflightCall[K, V])}
 }
 
-// register returns the call for the key. isLeader reports whether the
+// Register returns the call for the key. isLeader reports whether the
 // caller must run the fetch and complete the call.
 func (m *InflightManager[K, V]) Register(key K) (call *InflightCall[K, V], isLeader bool) {
 	m.mu.Lock()

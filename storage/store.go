@@ -205,14 +205,15 @@ func (s *Store[K, V]) deleteHash(hash uint64) {
 }
 
 // MayContains reports whether the disk cache may contain an entry with the
-// given key. Entries recently enqueued but not yet flushed also count.
-// It may report false positives on hash collisions.
+// given key. Entries recently enqueued but not yet flushed also count
+// (they are held by the keeper). It may report false positives on hash
+// collisions.
 func (s *Store[K, V]) MayContains(key K) bool {
 	hash, _, err := s.hashOf(key)
 	if err != nil {
 		return false
 	}
-	return s.engine.MayContains(hash)
+	return s.keeper.Contains(hash, key) || s.engine.MayContains(hash)
 }
 
 // StoreBuilder builds a Store with a filesystem-backed blob engine,

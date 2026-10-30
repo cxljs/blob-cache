@@ -127,7 +127,20 @@ foyer 的 block 引擎（固定 block、blob index 区、io task、异步轮转�
 11. **Load 与 vacuum 竞态**：读已删除 blob 的 not-exist 错误映射为 miss，不再向上抛错。
 12. 其余小项：emplace 已驻留快路径（对齐 foyer）、phantom 替换的 entries 指标、Remove 触发 OnLeave(EventRemove)、写失败清理 keeper refs、vacuum 拒绝回收当前 blob、OnDisk 插入 force=false。
 
-审查同时确认了未修复即正确的高风险区域：五种驱逐算法与 foyer 逐行一致（含 pinned 重插场景）、锁分级（mutable-acquire 写锁 / immutable-acquire 读锁+原子）、引用计数与 phantom 生命周期、恢复与 vacuum 的 Written/Invalid 记账、pipe 与 Close 的顺序。
+## 7.5 深度 Review 第三轮（独立审查，8 项修复）
+
+针对 round 2 大改后的新代码（hybrid inflight 重写、缓冲乒乓复用、Destroy 重写）再做一轮独立对抗审查，修复：
+
+1. **同批 `[delete, insert]` 丢失重插条目**（round 1 修复的反向副作用）：延迟应用 delete 会让同批稍后的 insert 被该 delete 删掉。重构：`handle` 严格按提交顺序内联处理（写入即索引、delete 即时应用），顺序语义与调用方完全一致（`TestStoreDeleteThenInsertSameBatch`）。
+2. **写失败后 keeper 注册泄漏**：批量写中途失败只清理了已写部分，失败条目及其后所有条目的 keeper 注册永久残留 → Load 永远命中幽灵值。重构后逐条处理：失败即中止剩余并逐个 `ref.Remove()`（`TestStoreWriteFailureDropsKeeper`，用注入写失败的 Device 包装器验证）。
+3. **batch 中止后 Wait 永久挂起**：同批的 wait 提交被 batchErr 跳过，waitCh 永不关闭。修复：waiter 收集不受错误影响（`TestStoreWriteFailureDropsKeeper` 覆盖）。
+4. **hybrid Get leader 无 panic 防护**：codec/weighter/监听器 panic 会让 inflight 泄漏、该 key 永久挂起。修复：与 GetOrFetch 相同的 recover→Complete→Unregister→re-panic（`TestHybridGetPanicDoesNotLeakInflight`）。
+5. **Get follower 对 leader miss 误记 hit 指标**。
+6. **MayContains 缺 keeper 检查**：对齐 foyer 的 `keeper.contains || engine.may_contains`（`TestMayContainsBeforeFlush`）。
+7. **vacuum 同 victim 内同 hash 多副本重复重插**：改为单遍扫描保留每 hash 的最后副本。
+8. 其余：自定义 picker 返回 current 时 reclaim 自旋防护、`closeErr` 成功批次后清零、Close/Destroy 并发串行化（destroyMu）、vacuum 重插同样受 MaxInt32 守护、清理不再使用的 rawRecord 与批量缓冲字段。
+
+审查确认干净的区域：inflight 协议（Register/Follow/Complete/Unregister/Done 无丢失无挂起）、缓冲乒乓复用无别名问题、keeper 指针身份在所有 supersede+flush 交错下安全、recover/vacuum 记账、pipePump 与 flushOnClose 顺序、Oversize 守护与 on-disk 格式一致性。
 
 ## 8. 性能
 

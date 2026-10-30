@@ -2,6 +2,7 @@ package memory
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -56,5 +57,57 @@ func TestCacheRemoveFiresEvent(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected a remove event, got %v", events)
+	}
+}
+
+// TestCacheClearResetsUsageMetric verifies the MemoryUsage gauge returns
+// to zero after Clear (regression: the gauge used to drift after clear).
+func TestCacheClearResetsUsageMetric(t *testing.T) {
+	c := newTestCache(t, 100)
+	for i := 0; i < 10; i++ {
+		e := c.Insert(fmt.Sprintf("k%d", i), i)
+		e.Release()
+	}
+	if c.Metrics().MemoryUsage.Load() != 10 {
+		t.Fatalf("usage gauge before clear = %d, want 10", c.Metrics().MemoryUsage.Load())
+	}
+	c.Clear()
+	if got := c.Metrics().MemoryUsage.Load(); got != 0 {
+		t.Fatalf("usage gauge after clear = %d, want 0", got)
+	}
+	if c.Metrics().MemoryEntries.Load() != 0 {
+		t.Fatalf("entries gauge after clear = %d, want 0", c.Metrics().MemoryEntries.Load())
+	}
+}
+
+// TestCacheUsageGaugeTracksEvictions verifies the MemoryUsage gauge stays
+// consistent with the actual usage across eviction paths (regression: the
+// gauge used to drift on Resize/EvictAll because evict() did not adjust
+// it).
+func TestCacheUsageGaugeTracksEvictions(t *testing.T) {
+	c := NewBuilder[string, string](10).WithShards(1).
+		WithWeighter(func(_, v string) int { return len(v) }).
+		Build()
+	for i := 0; i < 20; i++ {
+		e := c.Insert(fmt.Sprintf("k%d", i), strings.Repeat("x", 5))
+		e.Release()
+	}
+	if got, want := c.Metrics().MemoryUsage.Load(), int64(c.Usage()); got != want {
+		t.Fatalf("usage gauge = %d, actual usage = %d", got, want)
+	}
+	c.EvictAll()
+	if c.Usage() != 0 || c.Metrics().MemoryUsage.Load() != 0 {
+		t.Fatalf("after evictAll: usage=%d gauge=%d", c.Usage(), c.Metrics().MemoryUsage.Load())
+	}
+	// Resize also evicts; the gauge must follow.
+	for i := 0; i < 20; i++ {
+		e := c.Insert(fmt.Sprintf("k%d", i), strings.Repeat("x", 5))
+		e.Release()
+	}
+	if err := c.Resize(15); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := c.Metrics().MemoryUsage.Load(), int64(c.Usage()); got != want {
+		t.Fatalf("after resize: usage gauge = %d, actual usage = %d", got, want)
 	}
 }

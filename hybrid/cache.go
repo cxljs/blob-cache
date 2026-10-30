@@ -170,15 +170,35 @@ func (c *HybridCache[K, V]) Get(ctx context.Context, key K) (HybridCacheEntry[K,
 		<-call.Done()
 		select {
 		case entry := <-ch:
+			if entry.IsNil() {
+				// The leader missed; propagate the miss.
+				c.metrics.HybridMiss.Inc()
+				return HybridCacheEntry[K, V]{}, nil
+			}
 			c.metrics.HybridHit.Inc()
 			return entry, nil
 		default:
-			c.metrics.HybridMiss.Inc()
+			c.metrics.HybridError.Inc()
 			return HybridCacheEntry[K, V]{}, call.Err()
 		}
 	}
 
-	entry, err, hit := c.loadFromDisk(ctx, key)
+	// A panicking codec/weighter/listener must complete the call and
+	// unregister it before re-panicking, otherwise the in-flight entry
+	// leaks and every later Get of the key blocks forever.
+	var entry HybridCacheEntry[K, V]
+	var err error
+	var hit bool
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				call.Complete(HybridCacheEntry[K, V]{}, common.NewError(common.ErrorKindExternal, "get panicked"))
+				m.Unregister(key, call)
+				panic(p)
+			}
+		}()
+		entry, err, hit = c.loadFromDisk(ctx, key)
+	}()
 	call.Complete(entry, err)
 	m.Unregister(key, call)
 	switch {
@@ -246,7 +266,19 @@ func (c *HybridCache[K, V]) GetOrFetchWithProperties(ctx context.Context, key K,
 	var leaderEntry HybridCacheEntry[K, V]
 	var leaderErr error
 	if isLeader {
-		leaderEntry, leaderErr = c.getOrFetchLeader(ctx, key, fetch, props, call)
+		// A panicking fetch must complete the call AND unregister it before
+		// re-panicking, otherwise the in-flight entry leaks and every later
+		// GetOrFetch of the key fails forever.
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					call.Complete(HybridCacheEntry[K, V]{}, common.NewError(common.ErrorKindExternal, "user fetch panicked"))
+					m.Unregister(key, call)
+					panic(p)
+				}
+			}()
+			leaderEntry, leaderErr = c.getOrFetchLeader(ctx, key, fetch, props, call)
+		}()
 		m.Unregister(key, call)
 		if leaderErr != nil {
 			c.metrics.HybridError.Inc()
@@ -265,6 +297,10 @@ func (c *HybridCache[K, V]) GetOrFetchWithProperties(ctx context.Context, key K,
 	<-call.Done()
 	select {
 	case entry := <-ch:
+		if entry.IsNil() {
+			c.metrics.HybridError.Inc()
+			return HybridCacheEntry[K, V]{}, call.Err()
+		}
 		c.metrics.HybridHit.Inc()
 		return entry, nil
 	default:
@@ -276,13 +312,6 @@ func (c *HybridCache[K, V]) GetOrFetchWithProperties(ctx context.Context, key K,
 // getOrFetchLeader runs the disk-load/fetch chain for the leader of an
 // in-flight call and completes the call for the followers.
 func (c *HybridCache[K, V]) getOrFetchLeader(ctx context.Context, key K, fetch func() (V, error), props common.Properties, call *memory.InflightCall[K, V]) (HybridCacheEntry[K, V], error) {
-	defer func() {
-		if p := recover(); p != nil {
-			call.Complete(HybridCacheEntry[K, V]{}, context.Canceled)
-			panic(p)
-		}
-	}()
-
 	// 1. Disk cache load. Load errors are discarded: they fall through to
 	// the user fetch, mirroring foyer's optional-fetch error handling.
 	if c.store != nil {

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"sort"
 	"sync"
@@ -114,15 +115,6 @@ type submission[K comparable, V any] struct {
 	waitCh chan struct{}
 }
 
-// rawRecord is an entry record ready to be written.
-type rawRecord[K comparable, V any] struct {
-	hash  uint64
-	props common.Properties
-	key   []byte
-	value []byte
-	ref   *PieceRef[K, V] // nil for reclaimed survivors
-}
-
 // blobEngine is the blob-based disk cache engine. Entries are batched and
 // appended into blob files; the in-memory indexer maps hashes to their
 // addresses; over-capacity blobs are reclaimed by copying their surviving
@@ -144,17 +136,15 @@ type blobEngine[K comparable, V any] struct {
 	closed   bool
 	closeErr error
 	done     chan struct{}
+	// destroyMu serializes Destroy against itself and Close.
+	destroyMu sync.Mutex
 
 	// scratch is a flusher-goroutine-local serialization buffer, reused
 	// across records to avoid one allocation per entry.
 	scratch []byte
-	// recordBuf/deletesBuf/waitsBuf/batchBuf/refsBuf are flusher-goroutine
-	//-local scratch slices reused across batches.
-	recordBuf  []rawRecord[K, V]
-	deletesBuf []uint64
-	waitsBuf   []chan struct{}
-	batchBuf   []hashedAddress
-	refsBuf    []*PieceRef[K, V]
+	// waitsBuf is a flusher-goroutine-local scratch slice reused across
+	// batches.
+	waitsBuf []chan struct{}
 
 	// Flusher-owned state. Guarded by mu while the flusher is not running
 	// (i.e. during recovery and close).
@@ -202,9 +192,6 @@ func NewBlobEngine[K comparable, V any](cfg BlobEngineConfig[K, V]) (Engine[K, V
 		done:      make(chan struct{}),
 		blobs:     make(map[BlobID]*BlobInfo),
 		spare:     make([]submission[K, V], 0, 64),
-		recordBuf: make([]rawRecord[K, V], 0, 64),
-		batchBuf:  make([]hashedAddress, 0, 64),
-		refsBuf:   make([]*PieceRef[K, V], 0, 64),
 	}
 	e.cond = sync.NewCond(&e.mu)
 
@@ -354,6 +341,12 @@ func (e *blobEngine[K, V]) run() {
 			e.mu.Lock()
 			e.closeErr = err
 			e.mu.Unlock()
+		} else {
+			// A successful batch clears a previously recorded error so that
+			// Close does not report a stale failure.
+			e.mu.Lock()
+			e.closeErr = nil
+			e.mu.Unlock()
 		}
 
 		if closed {
@@ -371,108 +364,100 @@ func (e *blobEngine[K, V]) run() {
 	}
 }
 
-// handle processes one batch of submissions: inserts are encoded once and
-// written, deletes are applied after the writes (so that an entry that is
-// enqueued and deleted within the same batch is not resurrected by its own
-// write), and waiters are unblocked last.
+// handle processes one batch of submissions strictly in submission order:
+// an insert is written and indexed immediately, a delete is applied
+// immediately. Ordering inside one batch therefore matches the caller's
+// operation order (e.g. delete-then-insert keeps the inserted entry).
+// Waiters are unblocked after the whole batch is processed.
 func (e *blobEngine[K, V]) handle(batch []submission[K, V]) error {
-	records := e.recordBuf[:0]
-	deletes := e.deletesBuf[:0]
 	waitChs := e.waitsBuf[:0]
+	defer func() {
+		e.waitsBuf = waitChs
+	}()
+
+	var batchErr error
 	for _, s := range batch {
 		switch s.kind {
 		case subInsert:
-			if len(s.key)+len(s.value) > maxEntrySize(e.dev.BlobSize())-entryHeaderSize {
+			if batchErr != nil {
+				// The batch is aborted: drop the keeper registration so
+				// that the entry cannot be served from the keeper forever.
+				s.ref.Remove()
+				continue
+			}
+			if len(s.key)+len(s.value) > maxEntrySize(e.dev.BlobSize())-entryHeaderSize ||
+				int64(entryHeaderSize+len(s.key)+len(s.value)) > math.MaxInt32 {
+				// Oversized for the blob, or beyond the int32 record-length
+				// field of the on-disk format.
 				e.failEnqueue()
 				s.ref.Remove()
 				continue
 			}
-			records = append(records, rawRecord[K, V]{
-				hash:  s.hash,
-				props: s.ref.Piece.Properties(),
-				key:   s.key,
-				value: s.value,
-				ref:   s.ref,
-			})
+			if err := e.writeRecord(s.ref, s.hash, s.key, s.value, s.ref.Piece.Properties()); err != nil {
+				batchErr = err
+			}
 		case subDelete:
-			deletes = append(deletes, s.hash)
+			if batchErr != nil {
+				continue
+			}
+			if old, ok := e.ix.remove(s.hash); ok {
+				if bi, ok := e.blobs[old.Blob]; ok {
+					bi.Invalid += int64(old.Len)
+				}
+			}
 		case subWait:
+			// Waiters must always be unblocked, even when the batch was
+			// aborted by an error.
 			waitChs = append(waitChs, s.waitCh)
 		}
 	}
-	e.recordBuf = records
-	e.deletesBuf = deletes
 	e.waitsBuf = waitChs
 
-	err := e.writeRecords(records)
-	for _, hash := range deletes {
-		if old, ok := e.ix.remove(hash); ok {
-			if bi, ok := e.blobs[old.Blob]; ok {
-				bi.Invalid += int64(old.Len)
-			}
-		}
+	// Reclaim over-capacity blobs after a rotation.
+	if batchErr == nil && len(e.blobs) > e.maxBlobs {
+		batchErr = e.reclaim()
 	}
+
 	// Unblock waiters only after the batch has been processed.
 	for _, ch := range waitChs {
 		close(ch)
 	}
-	return err
+	return batchErr
 }
 
-// writeRecords appends records into the current blob, rotating and
-// reclaiming as needed.
-func (e *blobEngine[K, V]) writeRecords(records []rawRecord[K, V]) error {
-	batch := e.batchBuf[:0]
-	writtenRefs := e.refsBuf[:0]
-	defer func() {
-		e.batchBuf = batch
-		e.refsBuf = writtenRefs
-	}()
-
-	for _, r := range records {
-		if err := e.ensureSpace(int64(entryLen(len(r.key), len(r.value)))); err != nil {
-			// Drop the keeper registrations of what was already written;
-			// their bytes stay on the device unindexed and are treated as
-			// invalid by the next recovery/vacuum.
-			for _, ref := range writtenRefs {
-				ref.Remove()
-			}
-			return err
-		}
-		e.scratch = appendEntry(e.scratch[:0], r.hash, r.key, r.value, r.props)
-		if err := e.dev.Write(e.current, e.scratch, e.offset); err != nil {
-			for _, ref := range writtenRefs {
-				ref.Remove()
-			}
-			return err
-		}
-		batch = append(batch, hashedAddress{hash: r.hash, address: EntryAddress{
-			Blob:   e.current,
-			Offset: e.offset,
-			Len:    int32(len(e.scratch)),
-		}})
-		e.offset += int64(len(e.scratch))
-		e.blobs[e.current].Written = e.offset
-		if r.ref != nil {
-			writtenRefs = append(writtenRefs, r.ref)
+// writeRecord appends one record into the current blob (rotating as
+// needed) and indexes it immediately. ref may be nil for records without a
+// keeper registration (e.g. vacuum reinsertions); props must then be set.
+func (e *blobEngine[K, V]) writeRecord(ref *PieceRef[K, V], hash uint64, key, value []byte, props common.Properties) error {
+	dropRef := func() {
+		if ref != nil {
+			ref.Remove()
 		}
 	}
-
-	for _, old := range e.ix.insertBatch(batch) {
+	if err := e.ensureSpace(int64(entryLen(len(key), len(value)))); err != nil {
+		// The entry was not written; drop its keeper registration so that
+		// it cannot be served from the keeper forever.
+		dropRef()
+		return err
+	}
+	e.scratch = appendEntry(e.scratch[:0], hash, key, value, props)
+	if err := e.dev.Write(e.current, e.scratch, e.offset); err != nil {
+		dropRef()
+		return err
+	}
+	old, ok := e.ix.insert(hash, EntryAddress{
+		Blob:   e.current,
+		Offset: e.offset,
+		Len:    int32(len(e.scratch)),
+	})
+	if ok {
 		if bi, ok := e.blobs[old.Blob]; ok {
 			bi.Invalid += int64(old.Len)
 		}
 	}
-	for _, ref := range writtenRefs {
-		ref.Remove()
-	}
-
-	// Reclaim over-capacity blobs after a rotation.
-	if len(e.blobs) > e.maxBlobs {
-		if err := e.reclaim(); err != nil {
-			return err
-		}
-	}
+	e.offset += int64(len(e.scratch))
+	e.blobs[e.current].Written = e.offset
+	dropRef()
 	return nil
 }
 
@@ -492,7 +477,9 @@ func (e *blobEngine[K, V]) ensureSpace(need int64) error {
 func (e *blobEngine[K, V]) reclaim() error {
 	for len(e.blobs) > e.maxBlobs {
 		victim, ok := e.picker.Pick(e.blobs, e.current)
-		if !ok {
+		if !ok || victim == e.current {
+			// No reclaimable blob (a picker returning the blob being
+			// written cannot make progress either).
 			return nil
 		}
 		if err := e.vacuum(victim); err != nil {
@@ -522,7 +509,6 @@ func (e *blobEngine[K, V]) vacuum(victim BlobID) error {
 	}
 
 	blobSize := e.dev.BlobSize()
-	var batch []hashedAddress
 	reinserted := 0
 
 	if info.Written > int64(blobHeaderSize) {
@@ -534,6 +520,15 @@ func (e *blobEngine[K, V]) vacuum(victim BlobID) error {
 		if int64(len(data)) < limit {
 			limit = int64(len(data))
 		}
+		// Scan once, keeping only the LAST record per hash: for a hash
+		// written multiple times into the victim, the newest copy must be
+		// the one that survives.
+		type survivor struct {
+			props common.Properties
+			key   []byte
+			value []byte
+		}
+		last := make(map[uint64]survivor)
 		off := int64(blobHeaderSize)
 		for off < limit {
 			h, ok := parseEntryHeader(data[off:])
@@ -544,44 +539,39 @@ func (e *blobEngine[K, V]) vacuum(victim BlobID) error {
 			if off+total > limit {
 				break
 			}
+			if total > math.MaxInt32 {
+				break
+			}
 			key, value, ok := entryPayload(data[off+entryHeaderSize:], h)
 			if !ok || entryCRC(key, value) != h.crc {
 				break
 			}
+			last[h.hash] = survivor{props: h.props, key: key, value: value}
 			off += total
+		}
 
-			// Skip entries superseded by a newer write outside the victim.
-			if addr, ok := e.ix.get(h.hash); ok && addr.Blob != victim {
+		for hash, sv := range last {
+			// Skip entries superseded by a newer write outside the victim
+			// (the indexer still holds the pre-vacuum state here).
+			if addr, ok := e.ix.get(hash); ok && addr.Blob != victim {
 				continue
 			}
+			total := int64(entryLen(len(sv.key), len(sv.value)))
 			// Stop reinserting when the current blob cannot fit the entry
 			// without rotating; the remaining survivors are evicted.
 			if e.offset+total > blobSize {
 				break
 			}
-			e.scratch = appendEntry(e.scratch[:0], h.hash, key, value, h.props)
-			if err := e.dev.Write(e.current, e.scratch, e.offset); err != nil {
+			if err := e.writeRecord(nil, hash, sv.key, sv.value, sv.props); err != nil {
 				return err
 			}
-			batch = append(batch, hashedAddress{hash: h.hash, address: EntryAddress{
-				Blob:   e.current,
-				Offset: e.offset,
-				Len:    int32(len(e.scratch)),
-			}})
-			e.offset += int64(len(e.scratch))
-			e.blobs[e.current].Written = e.offset
 			reinserted++
 		}
 	}
 
-	// Drop all victim addresses (this evicts the survivors that were not
-	// reinserted), then register the new addresses of the reinserted ones.
+	// Drop whatever still points into the victim (the survivors that were
+	// not reinserted are evicted by this).
 	e.ix.removeBlob(victim)
-	for _, old := range e.ix.insertBatch(batch) {
-		if bi, ok := e.blobs[old.Blob]; ok {
-			bi.Invalid += int64(old.Len)
-		}
-	}
 
 	if e.metrics != nil {
 		e.metrics.StorageReinsert.Add(int64(reinserted))
@@ -761,8 +751,12 @@ func (e *blobEngine[K, V]) Close(ctx context.Context) error {
 // The old flusher is always joined (regardless of ctx cancellation)
 // before the state reset: letting it run past the reset would leave two
 // flushers mutating the same unlocked state. Destroy therefore always
-// completes atomically; ctx cancellation does not abort it.
+// completes atomically; ctx cancellation does not abort it. Concurrent
+// Close/Destroy calls are serialized.
 func (e *blobEngine[K, V]) Destroy(ctx context.Context) error {
+	e.destroyMu.Lock()
+	defer e.destroyMu.Unlock()
+
 	e.mu.Lock()
 	if !e.closed {
 		e.closed = true

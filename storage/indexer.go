@@ -92,6 +92,17 @@ func (ix *indexer) get(hash uint64) (EntryAddress, bool) {
 	return a, ok
 }
 
+// insert puts one address into the indexer, returning the overwritten
+// address (whose entry became invalid).
+func (ix *indexer) insert(hash uint64, address EntryAddress) (EntryAddress, bool) {
+	sh := ix.shard(hash)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	old, ok := sh.m[hash]
+	sh.m[hash] = address
+	return old, ok
+}
+
 // remove removes the address for the hash, returning the removed address.
 func (ix *indexer) remove(hash uint64) (EntryAddress, bool) {
 	sh := ix.shard(hash)

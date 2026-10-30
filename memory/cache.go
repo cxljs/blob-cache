@@ -381,6 +381,7 @@ func (s *shard[K, V]) emplace(rec *record[K, V], garbages *[]garbage[K, V]) {
 				s.ev.remove(old)
 			}
 			s.usage -= old.weight
+			s.metrics.MemoryUsage.Add(int64(-old.weight))
 			s.entries--
 			s.metrics.MemoryEntries.Dec()
 			*garbages = append(*garbages, garbage[K, V]{event: common.EventReplace, record: old})
@@ -390,8 +391,6 @@ func (s *shard[K, V]) emplace(rec *record[K, V], garbages *[]garbage[K, V]) {
 		s.metrics.MemoryInsert.Inc()
 		return
 	}
-
-	oldUsage := s.usage
 
 	// Evict overflow records to make room for the new one.
 	target := s.capacity - rec.weight
@@ -406,6 +405,7 @@ func (s *shard[K, V]) emplace(rec *record[K, V], garbages *[]garbage[K, V]) {
 			s.ev.remove(old)
 		}
 		s.usage -= old.weight
+		s.metrics.MemoryUsage.Add(int64(-old.weight))
 		*garbages = append(*garbages, garbage[K, V]{event: common.EventReplace, record: old})
 	} else {
 		s.metrics.MemoryInsert.Inc()
@@ -415,10 +415,8 @@ func (s *shard[K, V]) emplace(rec *record[K, V], garbages *[]garbage[K, V]) {
 
 	s.ev.push(rec)
 	s.usage += rec.weight
+	s.metrics.MemoryUsage.Add(int64(rec.weight))
 	rec.incRefs(1)
-
-	usage := int64(s.usage - oldUsage)
-	s.metrics.MemoryUsage.Add(usage)
 }
 
 // indexerInsert puts the record into the indexer, returning the replaced
@@ -459,6 +457,7 @@ func (s *shard[K, V]) evict(target int, garbages *[]garbage[K, V]) {
 			panic("blob-cache: indexer/eviction inconsistent")
 		}
 		s.usage -= evicted.weight
+		s.metrics.MemoryUsage.Add(int64(-evicted.weight))
 		s.entries--
 		s.metrics.MemoryEntries.Dec()
 
@@ -558,6 +557,7 @@ func (c *Cache[K, V]) Clear() {
 		for _, rec := range s.indexer {
 			records = append(records, rec)
 		}
+		oldUsage := s.usage
 		s.indexer = make(map[K]*record[K, V])
 		s.ev.clear()
 		s.usage = 0
@@ -573,6 +573,7 @@ func (c *Cache[K, V]) Clear() {
 			s.metrics.MemoryRemove.Add(int64(len(records)))
 			s.metrics.MemoryEntries.Add(-int64(len(records)))
 		}
+		s.metrics.MemoryUsage.Add(-int64(oldUsage))
 	}
 	c.fireGarbages(garbages)
 }

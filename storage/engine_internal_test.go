@@ -33,11 +33,10 @@ func TestVacuumStaleDuplicate(t *testing.T) {
 	vNew, _ := codec.EncodeValue("NEW")
 
 	// Two records, same hash, older first (submission order).
-	records := []rawRecord[string, string]{
-		{hash: 42, key: kb, value: vOld},
-		{hash: 42, key: kb, value: vNew},
+	if err := e.writeRecord(nil, 42, kb, vOld, common.Properties{}); err != nil {
+		t.Fatal(err)
 	}
-	if err := e.writeRecords(records); err != nil {
+	if err := e.writeRecord(nil, 42, kb, vNew, common.Properties{}); err != nil {
 		t.Fatal(err)
 	}
 	if a, _ := e.ix.get(42); a.Offset == 8 {
@@ -133,7 +132,7 @@ func TestVacuumCurrentBlobGuard(t *testing.T) {
 	codec := e.cfg.Codec
 	kb, _ := codec.EncodeKey("k")
 	vb, _ := codec.EncodeValue("v")
-	if err := e.writeRecords([]rawRecord[string, string]{{hash: 7, key: kb, value: vb}}); err != nil {
+	if err := e.writeRecord(nil, 7, kb, vb, common.Properties{}); err != nil {
 		t.Fatal(err)
 	}
 	// Vacuuming the current blob must be a no-op (not delete the file).
