@@ -142,6 +142,23 @@ foyer 的 block 引擎（固定 block、blob index 区、io task、异步轮转�
 
 审查确认干净的区域：inflight 协议（Register/Follow/Complete/Unregister/Done 无丢失无挂起）、缓冲乒乓复用无别名问题、keeper 指针身份在所有 supersede+flush 交错下安全、recover/vacuum 记账、pipePump 与 flushOnClose 顺序、Oversize 守护与 on-disk 格式一致性。
 
+## 7.6 深度 Review 第四轮（新视角：模型差分 + 故障注入 + soak）
+
+前三轮都是"读代码对照 foyer"，这一轮换成**自动化对抗测试**视角，新增四套常驻测试套件：
+
+1. **memory 策略无关差分测试**（`memory/differential_test.go`）：随机操作流（8 个种子 × 4000 操作 × 随机驱逐算法/分片数）持续校验跨算法不变量——命中必返回最新值、Contains 与 Get 一致、Remove 后必缺席、Clear/EvictAll 后清零、usage/entries 指标与实际状态零漂移、容量上界。
+2. **memory 精确 LRU 参考模型**（`memory/cache_model_test.go`）：单分片纯 LRU 与一个逐操作对账的参考实现比对——连驱逐受害者都逐一验证（含并发变体）。它先"抓到"两个分歧，核实后均为**模型伪差分**：(a) verify 的 Get 会触碰 LRU 顺序，模型需同步；(b) foyer 的 emplace 是"先驱逐到 capacity-weight、后替换"（raw.rs:190），满载替换会多驱逐一个无辜条目——实现与 foyer 完全一致，模型修正后全绿。这两个语义现在被测试钉死。
+3. **storage 差分 + 随机重启**（`storage/differential_test.go`）：随机 enqueue/delete/overwrite/重启（8 种子），核心不变量：Load 永远返回最新入队值、绝无脏值；重启后 delete 复活语义被显式建模。
+4. **storage 故障注入**（`storage/fault_test.go`）：包装 Device 随机注入 Read/Write/Sync/ReadAll/CreateBlob 失败。不变量：确认态之外的 Load 绝无脏值/外来值、不 panic 不挂起、故障停止并重启后每个确认条目按确认值恢复。
+5. **storage fuzz**（`storage/store_fuzz_test.go`）：随机大小值 + 覆盖 + 删除 + 重启，分 no-reclaim（强断言：全部存活）与 reclaim（只查无脏值）两种配置 × 6 种子。
+6. **hybrid 并发 soak**（`hybrid/soak_test.go`）：8 worker × 1500 随机操作 + 后台 churn，全程 -race，命中值必须属于值池。
+
+**本轮发现的实现 bug（1 个，独立 commit 修复）：**
+
+- **vacuum 复活已删除条目**：删除只移除内存索引，victim blob 里的数据副本变成"索引中不存在"，而 vacuum 把索引未命中的条目当作孤儿**重插**——导致删除后若触发回收，key 立即复活且可能带着旧副本。修复：对齐 foyer reclaimer 语义（不在 indexer 中的条目 = 已删/已覆盖 → 丢弃）。回归测试 `TestVacuumDropsDeletedEntries`。
+
+**本轮的测试侧修复**（非实现 bug，但值得记录）：differential verify 的 Get 会改变 LRU 顺序需同步模型、故障注入窗口内 enqueue 应标记"状态未知"、fuzz 的驱逐丢失阈值需按工作负载推导、soak 的 churn goroutine 停止顺序死锁、faultDevice 的 RNG 数据竞争。
+
 ## 8. 性能
 
 基准环境：AMD Ryzen 5 2500U / Linux / go1.25.3，`-benchmem -benchtime 1s`：
